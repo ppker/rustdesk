@@ -1,27 +1,40 @@
-use super::{CursorData, ResultType};
+use super::{gtk_sudo, CursorData, ResultType};
+use desktop::Desktop;
+use hbb_common::config::keys::OPTION_ALLOW_LINUX_HEADLESS;
 pub use hbb_common::platform::linux::*;
 use hbb_common::{
-    allow_err, bail,
+    allow_err,
+    anyhow::anyhow,
+    bail,
+    config::Config,
     libc::{c_char, c_int, c_long, c_void},
     log,
-    message_proto::Resolution,
+    message_proto::{DisplayInfo, Resolution},
     regex::{Captures, Regex},
 };
 use std::{
     cell::RefCell,
+    ffi::OsStr,
     path::{Path, PathBuf},
     process::{Child, Command},
+    string::String,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
+use users::{get_user_by_name, os::unix::UserExt};
+use wallpaper;
 
 type Xdo = *const c_void;
 
 pub const PA_SAMPLE_RATE: u32 = 48000;
 static mut UNMODIFIED: bool = true;
+
+lazy_static::lazy_static! {
+    pub static ref IS_X11: bool = hbb_common::platform::linux::is_x11_or_headless();
+}
 
 thread_local! {
     static XDO: RefCell<Xdo> = RefCell::new(unsafe { xdo_new(std::ptr::null()) });
@@ -36,6 +49,20 @@ extern "C" {
         screen_num: *mut c_int,
     ) -> c_int;
     fn xdo_new(display: *const c_char) -> Xdo;
+    fn xdo_get_active_window(xdo: Xdo, window: *mut *mut c_void) -> c_int;
+    fn xdo_get_window_location(
+        xdo: Xdo,
+        window: *mut c_void,
+        x: *mut c_int,
+        y: *mut c_int,
+        screen_num: *mut c_int,
+    ) -> c_int;
+    fn xdo_get_window_size(
+        xdo: Xdo,
+        window: *mut c_void,
+        width: *mut c_int,
+        height: *mut c_int,
+    ) -> c_int;
 }
 
 #[link(name = "X11")]
@@ -64,6 +91,22 @@ pub struct xcb_xfixes_get_cursor_image {
     pub pixels: *const c_long,
 }
 
+#[inline]
+pub fn is_headless_allowed() -> bool {
+    Config::get_option(OPTION_ALLOW_LINUX_HEADLESS) == "Y"
+}
+
+#[inline]
+pub fn is_login_screen_wayland() -> bool {
+    let values = get_values_of_seat0_with_gdm_wayland(&[0, 2]);
+    is_gdm_user(&values[1]) && get_display_server_of_session(&values[0]) == DISPLAY_SERVER_WAYLAND
+}
+
+#[inline]
+fn sleep_millis(millis: u64) {
+    std::thread::sleep(Duration::from_millis(millis));
+}
+
 pub fn get_cursor_pos() -> Option<(i32, i32)> {
     let mut res = None;
     XDO.with(|xdo| {
@@ -83,6 +126,50 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
 }
 
 pub fn reset_input_cache() {}
+
+pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
+    let mut res = None;
+    XDO.with(|xdo| {
+        if let Ok(xdo) = xdo.try_borrow_mut() {
+            if xdo.is_null() {
+                return;
+            }
+            let mut x: c_int = 0;
+            let mut y: c_int = 0;
+            let mut width: c_int = 0;
+            let mut height: c_int = 0;
+            let mut window: *mut c_void = std::ptr::null_mut();
+
+            unsafe {
+                if xdo_get_active_window(*xdo, &mut window) != 0 {
+                    return;
+                }
+                if xdo_get_window_location(
+                    *xdo,
+                    window,
+                    &mut x as _,
+                    &mut y as _,
+                    std::ptr::null_mut(),
+                ) != 0
+                {
+                    return;
+                }
+                if xdo_get_window_size(*xdo, window, &mut width as _, &mut height as _) != 0 {
+                    return;
+                }
+                let center_x = x + width / 2;
+                let center_y = y + height / 2;
+                res = displays.iter().position(|d| {
+                    center_x >= d.x
+                        && center_x < d.x + d.width
+                        && center_y >= d.y
+                        && center_y < d.y + d.height
+                });
+            }
+        }
+    });
+    res
+}
 
 pub fn get_cursor() -> ResultType<Option<u64>> {
     let mut res = None;
@@ -169,17 +256,35 @@ fn start_uinput_service() {
 }
 
 #[inline]
-fn try_start_server_(user: Option<(String, String)>) -> ResultType<Option<Child>> {
-    if user.is_some() {
-        run_as_user(vec!["--server"], user)
-    } else {
-        Ok(Some(crate::run_me(vec!["--server"])?))
+fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
+    match desktop {
+        Some(desktop) => {
+            let mut envs = vec![];
+            if !desktop.display.is_empty() {
+                envs.push(("DISPLAY", desktop.display.clone()));
+            }
+            if !desktop.xauth.is_empty() {
+                envs.push(("XAUTHORITY", desktop.xauth.clone()));
+            }
+            if !desktop.wl_display.is_empty() {
+                envs.push(("WAYLAND_DISPLAY", desktop.wl_display.clone()));
+            }
+            if !desktop.home.is_empty() {
+                envs.push(("HOME", desktop.home.clone()));
+            }
+            run_as_user(
+                vec!["--server"],
+                Some((desktop.uid.clone(), desktop.username.clone())),
+                envs,
+            )
+        }
+        None => Ok(Some(crate::run_me(vec!["--server"])?)),
     }
 }
 
 #[inline]
-fn start_server(user: Option<(String, String)>, server: &mut Option<Child>) {
-    match try_start_server_(user) {
+fn start_server(desktop: Option<&Desktop>, server: &mut Option<Child>) {
+    match try_start_server_(desktop) {
         Ok(ps) => *server = ps,
         Err(err) => {
             log::error!("Failed to start server: {}", err);
@@ -190,7 +295,7 @@ fn start_server(user: Option<(String, String)>, server: &mut Option<Child>) {
 fn stop_server(server: &mut Option<Child>) {
     if let Some(mut ps) = server.take() {
         allow_err!(ps.kill());
-        std::thread::sleep(Duration::from_millis(30));
+        sleep_millis(30);
         match ps.try_wait() {
             Ok(Some(_status)) => {}
             Ok(None) => {
@@ -201,82 +306,84 @@ fn stop_server(server: &mut Option<Child>) {
     }
 }
 
-fn set_x11_env(uid: &str) {
-    log::info!("uid of seat0: {}", uid);
-    let gdm = format!("/run/user/{}/gdm/Xauthority", uid);
-    let mut auth = get_env_tries("XAUTHORITY", uid, 10);
-    // auth is another user's when uid = 0, https://github.com/rustdesk/rustdesk/issues/2468
-    if auth.is_empty() || uid == "0" {
-        auth = if Path::new(&gdm).exists() {
-            gdm
-        } else {
-            let username = get_active_username();
-            if username == "root" {
-                format!("/{}/.Xauthority", username)
-            } else {
-                let tmp = format!("/home/{}/.Xauthority", username);
-                if Path::new(&tmp).exists() {
-                    tmp
-                } else {
-                    format!("/var/lib/{}/.Xauthority", username)
-                }
-            }
-        };
+fn set_x11_env(desktop: &Desktop) {
+    log::info!("DISPLAY: {}", desktop.display);
+    log::info!("XAUTHORITY: {}", desktop.xauth);
+    if !desktop.display.is_empty() {
+        std::env::set_var("DISPLAY", &desktop.display);
     }
-    let mut d = get_env("DISPLAY", uid);
-    if d.is_empty() {
-        d = get_display();
+    if !desktop.xauth.is_empty() {
+        std::env::set_var("XAUTHORITY", &desktop.xauth);
     }
-    if d.is_empty() {
-        d = ":0".to_owned();
-    }
-    d = d.replace(&whoami::hostname(), "").replace("localhost", "");
-    log::info!("DISPLAY: {}", d);
-    log::info!("XAUTHORITY: {}", auth);
-    std::env::set_var("XAUTHORITY", auth);
-    std::env::set_var("DISPLAY", d);
 }
 
+#[inline]
 fn stop_rustdesk_servers() {
-    let _ = run_cmds(format!(
-        r##"ps -ef | grep -E 'rustdesk +--server' | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+    let _ = run_cmds(&format!(
+        r##"ps -ef | grep -E '{} +--server' | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        crate::get_app_name().to_lowercase(),
+    ));
+}
+
+#[inline]
+fn stop_subprocess() {
+    let _ = run_cmds(&format!(
+        r##"ps -ef | grep '/etc/{}/xorg.conf' | grep -v grep | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        crate::get_app_name().to_lowercase(),
+    ));
+    let _ = run_cmds(&format!(
+        r##"ps -ef | grep -E '{} +--cm-no-ui' | grep -v grep | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        crate::get_app_name().to_lowercase(),
     ));
 }
 
 fn should_start_server(
     try_x11: bool,
+    is_display_changed: bool,
     uid: &mut String,
-    cur_uid: String,
+    desktop: &Desktop,
     cm0: &mut bool,
     last_restart: &mut Instant,
     server: &mut Option<Child>,
 ) -> bool {
     let cm = get_cm();
     let mut start_new = false;
-    if cur_uid != *uid && !cur_uid.is_empty() {
-        *uid = cur_uid;
+    let mut should_kill = false;
+
+    if desktop.is_headless() {
+        if !uid.is_empty() {
+            // From having a monitor to not having a monitor.
+            *uid = "".to_owned();
+            should_kill = true;
+        }
+    } else if is_display_changed || desktop.uid != *uid && !desktop.uid.is_empty() {
+        *uid = desktop.uid.clone();
         if try_x11 {
-            set_x11_env(&uid);
+            set_x11_env(&desktop);
         }
-        if let Some(ps) = server.as_mut() {
-            allow_err!(ps.kill());
-            std::thread::sleep(Duration::from_millis(30));
-            *last_restart = Instant::now();
-        }
-    } else if !cm
+        should_kill = true;
+    }
+
+    if !should_kill
+        && !cm
         && ((*cm0 && last_restart.elapsed().as_secs() > 60)
             || last_restart.elapsed().as_secs() > 3600)
     {
         // restart server if new connections all closed, or every one hour,
         // as a workaround to resolve "SpotUdp" (dns resolve)
         // and x server get displays failure issue
+        should_kill = true;
+        log::info!("restart server");
+    }
+
+    if should_kill {
         if let Some(ps) = server.as_mut() {
             allow_err!(ps.kill());
-            std::thread::sleep(Duration::from_millis(30));
+            sleep_millis(30);
             *last_restart = Instant::now();
-            log::info!("restart server");
         }
     }
+
     if let Some(ps) = server.as_mut() {
         match ps.try_wait() {
             Ok(Some(_)) => {
@@ -296,15 +403,24 @@ fn should_start_server(
 // stop_rustdesk_servers() is just a temp solution here.
 fn force_stop_server() {
     stop_rustdesk_servers();
-    std::thread::sleep(Duration::from_millis(super::SERVICE_INTERVAL));
+    sleep_millis(super::SERVICE_INTERVAL);
 }
 
 pub fn start_os_service() {
+    check_if_stop_service();
     stop_rustdesk_servers();
+    stop_subprocess();
     start_uinput_service();
+
+    std::thread::spawn(|| {
+        allow_err!(crate::ipc::start(crate::POSTFIX_SERVICE));
+    });
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
+    let (mut display, mut xauth): (String, String) = ("".to_owned(), "".to_owned());
+    let mut desktop = Desktop::default();
+    let mut sid = "".to_owned();
     let mut uid = "".to_owned();
     let mut server: Option<Child> = None;
     let mut user_server: Option<Child> = None;
@@ -317,62 +433,67 @@ pub fn start_os_service() {
     let mut cm0 = false;
     let mut last_restart = Instant::now();
     while running.load(Ordering::SeqCst) {
-        let (cur_uid, cur_user) = get_active_user_id_name();
+        desktop.refresh();
 
-        // for fixing https://github.com/rustdesk/rustdesk/issues/3129 to avoid too much dbus calling,
-        // though duplicate logic here with should_start_server
-        if !(cur_uid != *uid && !cur_uid.is_empty()) {
-            let cm = get_cm();
-            if !(!cm
-                && ((cm0 && last_restart.elapsed().as_secs() > 60)
-                    || last_restart.elapsed().as_secs() > 3600))
-            {
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        }
-
-        let is_wayland = current_is_wayland();
-
-        if cur_user == "root" || !is_wayland {
+        // Duplicate logic here with should_start_server
+        // Login wayland will try to start a headless --server.
+        if desktop.username == "root" || desktop.is_login_wayland() {
             // try kill subprocess "--server"
             stop_server(&mut user_server);
             // try start subprocess "--server"
+            // No need to check is_display_changed here.
             if should_start_server(
                 true,
+                false,
                 &mut uid,
-                cur_uid,
+                &desktop,
                 &mut cm0,
                 &mut last_restart,
                 &mut server,
             ) {
+                stop_subprocess();
                 force_stop_server();
                 start_server(None, &mut server);
             }
-        } else if cur_user != "" {
-            if cur_user != "gdm" {
-                // try kill subprocess "--server"
-                stop_server(&mut server);
+        } else if desktop.username != "" {
+            // try kill subprocess "--server"
+            stop_server(&mut server);
 
-                // try start subprocess "--server"
-                if should_start_server(
-                    false,
-                    &mut uid,
-                    cur_uid.clone(),
-                    &mut cm0,
-                    &mut last_restart,
-                    &mut user_server,
-                ) {
-                    force_stop_server();
-                    start_server(Some((cur_uid, cur_user)), &mut user_server);
-                }
+            let is_display_changed = desktop.display != display || desktop.xauth != xauth;
+            display = desktop.display.clone();
+            xauth = desktop.xauth.clone();
+
+            // try start subprocess "--server"
+            if should_start_server(
+                !desktop.is_wayland(),
+                is_display_changed,
+                &mut uid,
+                &desktop,
+                &mut cm0,
+                &mut last_restart,
+                &mut user_server,
+            ) {
+                stop_subprocess();
+                force_stop_server();
+                start_server(Some(&desktop), &mut user_server);
             }
         } else {
             force_stop_server();
             stop_server(&mut user_server);
             stop_server(&mut server);
         }
-        std::thread::sleep(Duration::from_millis(super::SERVICE_INTERVAL));
+
+        let keeps_headless = sid.is_empty() && desktop.is_headless();
+        let keeps_session = sid == desktop.sid;
+        if keeps_headless || keeps_session {
+            // for fixing https://github.com/rustdesk/rustdesk/issues/3129 to avoid too much dbus calling,
+            sleep_millis(500);
+        } else {
+            sleep_millis(super::SERVICE_INTERVAL);
+        }
+        if !desktop.is_headless() {
+            sid = desktop.sid.clone();
+        }
     }
 
     if let Some(ps) = user_server.take().as_mut() {
@@ -384,13 +505,15 @@ pub fn start_os_service() {
     log::info!("Exit");
 }
 
+#[inline]
 pub fn get_active_user_id_name() -> (String, String) {
-    let vec_id_name = get_values_of_seat0([1, 2].to_vec());
+    let vec_id_name = get_values_of_seat0(&[1, 2]);
     (vec_id_name[0].clone(), vec_id_name[1].clone())
 }
 
+#[inline]
 pub fn get_active_userid() -> String {
-    get_values_of_seat0([1].to_vec())[0].clone()
+    get_values_of_seat0(&[1])[0].clone()
 }
 
 fn get_cm() -> bool {
@@ -409,58 +532,27 @@ fn get_cm() -> bool {
     false
 }
 
-fn get_display() -> String {
-    let user = get_active_username();
-    log::debug!("w {}", &user);
-    if let Ok(output) = Command::new("w").arg(&user).output() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            log::debug!("  {}", line);
-            let mut iter = line.split_whitespace();
-            let b = iter.nth(2);
-            if let Some(b) = b {
-                if b.starts_with(":") {
-                    return b.to_owned();
-                }
-            }
-        }
-    }
-    // above not work for gdm user
-    log::debug!("ls -l /tmp/.X11-unix/");
-    let mut last = "".to_owned();
-    if let Ok(output) = Command::new("ls")
-        .args(vec!["-l", "/tmp/.X11-unix/"])
-        .output()
-    {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            log::debug!("  {}", line);
-            let mut iter = line.split_whitespace();
-            let user_field = iter.nth(2);
-            if let Some(x) = iter.last() {
-                if x.starts_with("X") {
-                    last = x.replace("X", ":").to_owned();
-                    if user_field == Some(&user) {
-                        return last;
-                    }
-                }
-            }
-        }
-    }
-    last
-}
-
 pub fn is_login_wayland() -> bool {
-    if let Ok(contents) = std::fs::read_to_string("/etc/gdm3/custom.conf") {
-        contents.contains("#WaylandEnable=false") || contents.contains("WaylandEnable=true")
-    } else if let Ok(contents) = std::fs::read_to_string("/etc/gdm/custom.conf") {
-        contents.contains("#WaylandEnable=false") || contents.contains("WaylandEnable=true")
-    } else {
-        false
+    let files = ["/etc/gdm3/custom.conf", "/etc/gdm/custom.conf"];
+    match (
+        Regex::new(r"# *WaylandEnable *= *false"),
+        Regex::new(r"WaylandEnable *= *true"),
+    ) {
+        (Ok(pat1), Ok(pat2)) => {
+            for file in files {
+                if let Ok(contents) = std::fs::read_to_string(file) {
+                    return pat1.is_match(&contents) || pat2.is_match(&contents);
+                }
+            }
+        }
+        _ => {}
     }
+    false
 }
 
+#[inline]
 pub fn current_is_wayland() -> bool {
-    let dtype = get_display_server();
-    return "wayland" == dtype && unsafe { UNMODIFIED };
+    return is_desktop_wayland() && unsafe { UNMODIFIED };
 }
 
 // to-do: test the other display manager
@@ -473,22 +565,60 @@ fn _get_display_manager() -> String {
     "gdm3".to_owned()
 }
 
+#[inline]
 pub fn get_active_username() -> String {
-    get_values_of_seat0([2].to_vec())[0].clone()
+    get_values_of_seat0(&[2])[0].clone()
+}
+
+pub fn get_user_home_by_name(username: &str) -> Option<PathBuf> {
+    return match get_user_by_name(username) {
+        None => None,
+        Some(user) => {
+            let home = user.home_dir();
+            if Path::is_dir(home) {
+                Some(PathBuf::from(home))
+            } else {
+                None
+            }
+        }
+    };
 }
 
 pub fn get_active_user_home() -> Option<PathBuf> {
     let username = get_active_username();
     if !username.is_empty() {
-        let home = PathBuf::from(format!("/home/{}", username));
-        if home.exists() {
-            return Some(home);
+        match get_user_home_by_name(&username) {
+            None => {
+                // fallback to most common default pattern
+                let home = PathBuf::from(format!("/home/{}", username));
+                if home.exists() {
+                    return Some(home);
+                }
+            }
+            Some(home) => {
+                return Some(home);
+            }
         }
     }
     None
 }
 
+pub fn get_env_var(k: &str) -> String {
+    match std::env::var(k) {
+        Ok(v) => v,
+        Err(_e) => "".to_owned(),
+    }
+}
+
+fn is_flatpak() -> bool {
+    std::path::PathBuf::from("/.flatpak-info").exists()
+}
+
+// Headless is enabled, always return true.
 pub fn is_prelogin() -> bool {
+    if is_flatpak() {
+        return false;
+    }
     let n = get_active_userid().len();
     n < 4 && n > 1
 }
@@ -498,7 +628,7 @@ pub fn is_root() -> bool {
 }
 
 fn is_opensuse() -> bool {
-    if let Ok(res) = run_cmds("cat /etc/os-release | grep opensuse".to_owned()) {
+    if let Ok(res) = run_cmds("cat /etc/os-release | grep opensuse") {
         if !res.is_empty() {
             return true;
         }
@@ -506,21 +636,31 @@ fn is_opensuse() -> bool {
     false
 }
 
-pub fn run_as_user(arg: Vec<&str>, user: Option<(String, String)>) -> ResultType<Option<Child>> {
+pub fn run_as_user<I, K, V>(
+    arg: Vec<&str>,
+    user: Option<(String, String)>,
+    envs: I,
+) -> ResultType<Option<Child>>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
     let (uid, username) = match user {
         Some(id_name) => id_name,
         None => get_active_user_id_name(),
     };
     let cmd = std::env::current_exe()?;
+    if uid.is_empty() {
+        bail!("No valid uid");
+    }
     let xdg = &format!("XDG_RUNTIME_DIR=/run/user/{}", uid) as &str;
     let mut args = vec![xdg, "-u", &username, cmd.to_str().unwrap_or("")];
     args.append(&mut arg.clone());
-    // -E required for opensuse
-    if is_opensuse() {
-        args.insert(0, "-E");
-    }
+    // -E is required to preserve env
+    args.insert(0, "-E");
 
-    let task = Command::new("sudo").args(args).spawn()?;
+    let task = Command::new("sudo").envs(envs).args(args).spawn()?;
     Ok(Some(task))
 }
 
@@ -589,29 +729,33 @@ pub fn toggle_blank_screen(_v: bool) {
     // https://unix.stackexchange.com/questions/17170/disable-keyboard-mouse-input-on-unix-under-x
 }
 
-pub fn block_input(_v: bool) -> bool {
-    true
+pub fn block_input(_v: bool) -> (bool, String) {
+    (true, "".to_owned())
 }
 
 pub fn is_installed() -> bool {
-    true
-}
-
-fn get_env_tries(name: &str, uid: &str, n: usize) -> String {
-    for _ in 0..n {
-        let x = get_env(name, uid);
-        if !x.is_empty() {
-            return x;
-        }
-        std::thread::sleep(Duration::from_millis(300));
+    if let Ok(p) = std::env::current_exe() {
+        p.to_str().unwrap_or_default().starts_with("/usr")
+            || p.to_str().unwrap_or_default().starts_with("/nix/store")
+    } else {
+        false
     }
-    "".to_owned()
 }
 
-fn get_env(name: &str, uid: &str) -> String {
-    let cmd = format!("ps -u {} -o pid= | xargs -I__ cat /proc/__/environ 2>/dev/null | tr '\\0' '\\n' | grep '^{}=' | tail -1 | sed 's/{}=//g'", uid, name, name);
-    log::debug!("Run: {}", &cmd);
-    if let Ok(x) = run_cmds(cmd) {
+#[inline]
+fn get_env(name: &str, uid: &str, process: &str) -> String {
+    let cmd = format!("ps -u {} -f | grep -E '{}' | grep -v 'grep' | tail -1 | awk '{{print $2}}' | xargs -I__ cat /proc/__/environ 2>/dev/null | tr '\\0' '\\n' | grep '^{}=' | tail -1 | sed 's/{}=//g'", uid, process, name, name);
+    if let Ok(x) = run_cmds(&cmd) {
+        x.trim_end().to_string()
+    } else {
+        "".to_owned()
+    }
+}
+
+#[inline]
+fn get_env_from_pid(name: &str, pid: &str) -> String {
+    let cmd = format!("cat /proc/{}/environ 2>/dev/null | tr '\\0' '\\n' | grep '^{}=' | tail -1 | sed 's/{}=//g'", pid, name, name);
+    if let Ok(x) = run_cmds(&cmd) {
         x.trim_end().to_string()
     } else {
         "".to_owned()
@@ -627,17 +771,53 @@ pub fn quit_gui() {
     unsafe { gtk_main_quit() };
 }
 
-pub fn check_super_user_permission() -> ResultType<bool> {
-    let file = "/usr/share/rustdesk/files/polkit";
-    let arg;
-    if Path::new(file).is_file() {
-        arg = file;
-    } else {
-        arg = "echo";
-    }
-    let status = Command::new("pkexec").arg(arg).status()?;
-    Ok(status.success() && status.code() == Some(0))
+/*
+pub fn exec_privileged(args: &[&str]) -> ResultType<Child> {
+    Ok(Command::new("pkexec").args(args).spawn()?)
 }
+*/
+
+pub fn check_super_user_permission() -> ResultType<bool> {
+    gtk_sudo::run(vec!["echo"])?;
+    Ok(true)
+}
+
+/*
+pub fn elevate(args: Vec<&str>) -> ResultType<bool> {
+    let cmd = std::env::current_exe()?;
+    match cmd.to_str() {
+        Some(cmd) => {
+            let mut args_with_exe = vec![cmd];
+            args_with_exe.append(&mut args.clone());
+            // -E required for opensuse
+            if is_opensuse() {
+                args_with_exe.insert(0, "-E");
+            }
+            let res = match exec_privileged(&args_with_exe)?.wait() {
+                Ok(status) => {
+                    if status.success() {
+                        true
+                    } else {
+                        log::error!(
+                            "Failed to wait install process, process status: {:?}",
+                            status
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to wait install process, error: {}", e);
+                    false
+                }
+            };
+            Ok(res)
+        }
+        None => {
+            hbb_common::bail!("Failed to get current exe as str");
+        }
+    }
+}
+*/
 
 type GtkSettingsPtr = *mut c_void;
 type GObjectPtr = *mut c_void;
@@ -657,7 +837,9 @@ pub fn get_double_click_time() -> u32 {
     // g_object_get (settings, "gtk-double-click-time", &double_click_time, NULL);
     unsafe {
         let mut double_click_time = 0u32;
-        let property = std::ffi::CString::new("gtk-double-click-time").unwrap();
+        let Ok(property) = std::ffi::CString::new("gtk-double-click-time") else {
+            return 0;
+        };
         let settings = gtk_settings_get_default();
         g_object_get(
             settings,
@@ -701,7 +883,7 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
     let connected_pat = get_xrandr_conn_pat(name);
     let mut v = vec![];
     if let Ok(re) = Regex::new(&format!("{}{}", connected_pat, resolutions_pat)) {
-        match run_cmds("xrandr --query | tr -s ' '".to_owned()) {
+        match run_cmds("xrandr --query | tr -s ' '") {
             Ok(xrandr_output) => {
                 // There'are different kinds of xrandr output.
                 /*
@@ -714,6 +896,12 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
                 Virtual2 disconnected (normal left inverted right x axis y axis)
                 Virtual3 disconnected (normal left inverted right x axis y axis)
 
+                Screen 0: minimum 320 x 200, current 1920 x 1080, maximum 16384 x 16384
+                eDP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 344mm x 193mm
+                1920x1080     60.01*+  60.01    59.97    59.96    59.93
+                1680x1050     59.95    59.88
+                1600x1024     60.17
+
                 XWAYLAND0 connected primary 1920x984+0+0 (normal left inverted right x axis y axis) 0mm x 0mm
                 Virtual1 connected primary 1920x984+0+0 (normal left inverted right x axis y axis) 0mm x 0mm
                 HDMI-0 connected (normal left inverted right x axis y axis)
@@ -723,8 +911,11 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
                 if let Some(caps) = re.captures(&xrandr_output) {
                     if let Some(resolutions) = caps.name("resolutions") {
                         let resolution_pat =
-                            r"\s*(?P<width>\d+)x(?P<height>\d+)\s+(?P<rates>(\d+\.\d+[* ]*)+)\s*\n";
-                        let resolution_re = Regex::new(&format!(r"{}", resolution_pat)).unwrap();
+                            r"\s*(?P<width>\d+)x(?P<height>\d+)\s+(?P<rates>(\d+\.\d+\D*)+)\s*\n";
+                        let Ok(resolution_re) = Regex::new(&format!(r"{}", resolution_pat)) else {
+                            log::error!("Regex new failed");
+                            return vec![];
+                        };
                         for resolution_caps in resolution_re.captures_iter(resolutions.as_str()) {
                             if let Some((width, height)) =
                                 get_width_height_from_captures(&resolution_caps)
@@ -750,7 +941,7 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
 }
 
 pub fn current_resolution(name: &str) -> ResultType<Resolution> {
-    let xrandr_output = run_cmds("xrandr --query | tr -s ' '".to_owned())?;
+    let xrandr_output = run_cmds("xrandr --query | tr -s ' '")?;
     let re = Regex::new(&get_xrandr_conn_pat(name))?;
     if let Some(caps) = re.captures(&xrandr_output) {
         if let Some((width, height)) = get_width_height_from_captures(&caps) {
@@ -764,7 +955,7 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
     bail!("Failed to find current resolution for {}", name);
 }
 
-pub fn change_resolution(name: &str, width: usize, height: usize) -> ResultType<()> {
+pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
     Command::new("xrandr")
         .args(vec![
             "--output",
@@ -774,4 +965,527 @@ pub fn change_resolution(name: &str, width: usize, height: usize) -> ResultType<
         ])
         .spawn()?;
     Ok(())
+}
+
+#[inline]
+pub fn is_xwayland_running() -> bool {
+    if let Ok(output) = run_cmds("pgrep -a Xwayland") {
+        return output.contains("Xwayland");
+    }
+    false
+}
+
+mod desktop {
+    use super::*;
+
+    pub const XFCE4_PANEL: &str = "xfce4-panel";
+    pub const SDDM_GREETER: &str = "sddm-greeter";
+
+    const XWAYLAND: &str = "Xwayland";
+    const IBUS_DAEMON: &str = "ibus-daemon";
+    const PLASMA_KDED: &str = "kded[0-9]+";
+    const GNOME_GOA_DAEMON: &str = "goa-daemon";
+
+    #[derive(Debug, Clone, Default)]
+    pub struct Desktop {
+        pub sid: String,
+        pub username: String,
+        pub uid: String,
+        pub protocal: String,
+        pub display: String,
+        pub xauth: String,
+        pub home: String,
+        pub is_rustdesk_subprocess: bool,
+        pub wl_display: String,
+    }
+
+    impl Desktop {
+        #[inline]
+        pub fn is_wayland(&self) -> bool {
+            self.protocal == DISPLAY_SERVER_WAYLAND
+        }
+
+        #[inline]
+        pub fn is_login_wayland(&self) -> bool {
+            super::is_gdm_user(&self.username) && self.protocal == DISPLAY_SERVER_WAYLAND
+        }
+
+        #[inline]
+        pub fn is_headless(&self) -> bool {
+            self.sid.is_empty() || self.is_rustdesk_subprocess
+        }
+
+        fn get_display_xauth_xwayland(&mut self) {
+            let tray = format!("{} +--tray", crate::get_app_name().to_lowercase());
+            for _ in 0..5 {
+                let display_proc = vec![
+                    XWAYLAND,
+                    IBUS_DAEMON,
+                    GNOME_GOA_DAEMON,
+                    PLASMA_KDED,
+                    tray.as_str(),
+                ];
+                for proc in display_proc {
+                    self.display = get_env("DISPLAY", &self.uid, proc);
+                    self.xauth = get_env("XAUTHORITY", &self.uid, proc);
+                    self.wl_display = get_env("WAYLAND_DISPLAY", &self.uid, proc);
+                    if !self.display.is_empty() && !self.xauth.is_empty() {
+                        break;
+                    }
+                }
+                sleep_millis(300);
+            }
+        }
+
+        fn get_display_x11(&mut self) {
+            for _ in 0..10 {
+                let display_proc = vec![
+                    XWAYLAND,
+                    IBUS_DAEMON,
+                    GNOME_GOA_DAEMON,
+                    PLASMA_KDED,
+                    XFCE4_PANEL,
+                    SDDM_GREETER,
+                ];
+                for proc in display_proc {
+                    self.display = get_env("DISPLAY", &self.uid, proc);
+                    if !self.display.is_empty() {
+                        break;
+                    }
+                }
+                sleep_millis(300);
+            }
+
+            if self.display.is_empty() {
+                self.display = Self::get_display_by_user(&self.username);
+            }
+            if self.display.is_empty() {
+                self.display = ":0".to_owned();
+            }
+            self.display = self
+                .display
+                .replace(&whoami::hostname(), "")
+                .replace("localhost", "");
+        }
+
+        fn get_home(&mut self) {
+            self.home = "".to_string();
+
+            let cmd = format!(
+                "getent passwd '{}' | awk -F':' '{{print $6}}'",
+                &self.username
+            );
+            self.home = run_cmds_trim_newline(&cmd).unwrap_or(format!("/home/{}", &self.username));
+        }
+
+        fn get_xauth_from_xorg(&mut self) {
+            if let Ok(output) = run_cmds(&format!(
+                "ps -u {} -f | grep 'Xorg' | grep -v 'grep'",
+                &self.uid
+            )) {
+                for line in output.lines() {
+                    let mut auth_found = false;
+
+                    for v in line.split_whitespace() {
+                        if v == "-auth" {
+                            auth_found = true;
+                        } else if auth_found {
+                            if std::path::Path::new(v).is_absolute()
+                                && std::path::Path::new(v).exists()
+                            {
+                                self.xauth = v.to_string();
+                            } else {
+                                if let Some(pid) = line.split_whitespace().nth(1) {
+                                    let mut base_dir: String = String::from("/home"); // default pattern
+                                    let home_dir = get_env_from_pid("HOME", pid);
+                                    if home_dir.is_empty() {
+                                        if let Some(home) = get_user_home_by_name(&self.username) {
+                                            base_dir = home.as_path().to_string_lossy().to_string();
+                                        };
+                                    } else {
+                                        base_dir = home_dir;
+                                    }
+                                    if Path::new(&base_dir).exists() {
+                                        self.xauth = format!("{}/{}", base_dir, v);
+                                    };
+                                } else {
+                                    // unreachable!
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn get_xauth_x11(&mut self) {
+            // try by direct access to window manager process by name
+            let tray = format!("{} +--tray", crate::get_app_name().to_lowercase());
+            for _ in 0..10 {
+                let display_proc = vec![
+                    XWAYLAND,
+                    IBUS_DAEMON,
+                    GNOME_GOA_DAEMON,
+                    PLASMA_KDED,
+                    XFCE4_PANEL,
+                    SDDM_GREETER,
+                    tray.as_str(),
+                ];
+                for proc in display_proc {
+                    self.xauth = get_env("XAUTHORITY", &self.uid, proc);
+                    if !self.xauth.is_empty() {
+                        break;
+                    }
+                }
+                sleep_millis(300);
+            }
+
+            // get from Xorg process, parameter and environment
+            if self.xauth.is_empty() {
+                self.get_xauth_from_xorg();
+            }
+
+            // fallback to default file name
+            if self.xauth.is_empty() {
+                let gdm = format!("/run/user/{}/gdm/Xauthority", self.uid);
+                self.xauth = if std::path::Path::new(&gdm).exists() {
+                    gdm
+                } else {
+                    let username = &self.username;
+                    match get_user_home_by_name(username) {
+                        None => {
+                            if username == "root" {
+                                format!("/{}/.Xauthority", username)
+                            } else {
+                                let tmp = format!("/home/{}/.Xauthority", username);
+                                if std::path::Path::new(&tmp).exists() {
+                                    tmp
+                                } else {
+                                    format!("/var/lib/{}/.Xauthority", username)
+                                }
+                            }
+                        }
+                        Some(home) => {
+                            format!(
+                                "{}/.Xauthority",
+                                home.as_path().to_string_lossy().to_string()
+                            )
+                        }
+                    }
+                };
+            }
+        }
+
+        fn get_display_by_user(user: &str) -> String {
+            // log::debug!("w {}", &user);
+            if let Ok(output) = std::process::Command::new("w").arg(&user).output() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let mut iter = line.split_whitespace();
+                    let b = iter.nth(2);
+                    if let Some(b) = b {
+                        if b.starts_with(":") {
+                            return b.to_owned();
+                        }
+                    }
+                }
+            }
+            // above not work for gdm user
+            //log::debug!("ls -l /tmp/.X11-unix/");
+            let mut last = "".to_owned();
+            if let Ok(output) = std::process::Command::new("ls")
+                .args(vec!["-l", "/tmp/.X11-unix/"])
+                .output()
+            {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let mut iter = line.split_whitespace();
+                    let user_field = iter.nth(2);
+                    if let Some(x) = iter.last() {
+                        if x.starts_with("X") {
+                            last = x.replace("X", ":").to_owned();
+                            if user_field == Some(&user) {
+                                return last;
+                            }
+                        }
+                    }
+                }
+            }
+            last
+        }
+
+        fn set_is_subprocess(&mut self) {
+            self.is_rustdesk_subprocess = false;
+            let cmd = format!(
+                "ps -ef | grep '{}/xorg.conf' | grep -v grep | wc -l",
+                crate::get_app_name().to_lowercase()
+            );
+            if let Ok(res) = run_cmds(&cmd) {
+                if res.trim() != "0" {
+                    self.is_rustdesk_subprocess = true;
+                }
+            }
+        }
+
+        pub fn refresh(&mut self) {
+            if !self.sid.is_empty() && is_active_and_seat0(&self.sid) {
+                // Xwayland display and xauth may not be available in a short time after login.
+                if is_xwayland_running() && !self.is_login_wayland() {
+                    self.get_display_xauth_xwayland();
+                    self.is_rustdesk_subprocess = false;
+                }
+                return;
+            }
+
+            let seat0_values = get_values_of_seat0_with_gdm_wayland(&[0, 1, 2]);
+            if seat0_values[0].is_empty() {
+                *self = Self::default();
+                self.is_rustdesk_subprocess = false;
+                return;
+            }
+
+            self.sid = seat0_values[0].clone();
+            self.uid = seat0_values[1].clone();
+            self.username = seat0_values[2].clone();
+            self.protocal = get_display_server_of_session(&self.sid).into();
+            if self.is_login_wayland() {
+                self.display = "".to_owned();
+                self.xauth = "".to_owned();
+                self.is_rustdesk_subprocess = false;
+                return;
+            }
+
+            self.get_home();
+            if self.is_wayland() {
+                if is_xwayland_running() {
+                    self.get_display_xauth_xwayland();
+                } else {
+                    self.display = "".to_owned();
+                    self.xauth = "".to_owned();
+                }
+                self.is_rustdesk_subprocess = false;
+            } else {
+                self.get_display_x11();
+                self.get_xauth_x11();
+                self.set_is_subprocess();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_desktop_env() {
+            let mut d = Desktop::default();
+            d.refresh();
+            if d.username == "root" {
+                assert_eq!(d.home, "/root");
+            } else {
+                if !d.username.is_empty() {
+                    let home = super::super::get_env_var("HOME");
+                    if !home.is_empty() {
+                        assert_eq!(d.home, home);
+                    } else {
+                        //
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct WakeLock(Option<keepawake::AwakeHandle>);
+
+impl WakeLock {
+    pub fn new(display: bool, idle: bool, sleep: bool) -> Self {
+        WakeLock(
+            keepawake::Builder::new()
+                .display(display)
+                .idle(idle)
+                .sleep(sleep)
+                .create()
+                .ok(),
+        )
+    }
+}
+
+fn has_cmd(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .status()
+        .map(|x| x.success())
+        .unwrap_or_default()
+}
+
+pub fn run_cmds_privileged(cmds: &str) -> bool {
+    crate::platform::gtk_sudo::run(vec![cmds]).is_ok()
+}
+
+pub fn run_me_with(secs: u32) {
+    let exe = std::env::current_exe()
+        .unwrap_or("".into())
+        .to_string_lossy()
+        .to_string();
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&format!("sleep {secs}; {exe}"))
+        .spawn()
+        .ok();
+}
+
+fn switch_service(stop: bool) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    Config::set_option("stop-service".into(), if stop { "Y" } else { "" }.into());
+    if home != "/root" && !Config::get().is_empty() {
+        let p = format!(".config/{}", crate::get_app_name().to_lowercase());
+        let app_name0 = crate::get_app_name();
+        format!("cp -f {home}/{p}/{app_name0}.toml /root/{p}/; cp -f {home}/{p}/{app_name0}2.toml /root/{p}/;")
+    } else {
+        "".to_owned()
+    }
+}
+
+pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
+    if !has_cmd("systemctl") {
+        // Failed when installed + flutter run + started by `show_new_window`.
+        return false;
+    }
+    log::info!("Uninstalling service...");
+    let cp = switch_service(true);
+    let app_name = crate::get_app_name().to_lowercase();
+    // systemctl kill rustdesk --tray, execute cp first
+    if !run_cmds_privileged(&format!(
+        "{cp} systemctl disable {app_name}; systemctl stop {app_name};"
+    )) {
+        Config::set_option("stop-service".into(), "".into());
+        return true;
+    }
+    // systemctl stop will kill child processes, below may not be executed.
+    if show_new_window {
+        run_me_with(2);
+    }
+    std::process::exit(0);
+}
+
+pub fn install_service() -> bool {
+    let _installing = crate::platform::InstallingService::new();
+    if !has_cmd("systemctl") {
+        return false;
+    }
+    log::info!("Installing service...");
+    let cp = switch_service(false);
+    let app_name = crate::get_app_name().to_lowercase();
+    if !run_cmds_privileged(&format!(
+        "{cp} systemctl enable {app_name}; systemctl start {app_name};"
+    )) {
+        Config::set_option("stop-service".into(), "Y".into());
+    }
+    true
+}
+
+fn check_if_stop_service() {
+    if Config::get_option("stop-service".into()) == "Y" {
+        let app_name = crate::get_app_name().to_lowercase();
+        allow_err!(run_cmds(&format!(
+            "systemctl disable {app_name}; systemctl stop {app_name}"
+        )));
+    }
+}
+
+pub fn check_autostart_config() -> ResultType<()> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let app_name = crate::get_app_name().to_lowercase();
+    let path = format!("{home}/.config/autostart");
+    let file = format!("{path}/{app_name}.desktop");
+    // https://github.com/rustdesk/rustdesk/issues/4863
+    std::fs::remove_file(&file).ok();
+    /*
+        std::fs::create_dir_all(&path).ok();
+        if !Path::new(&file).exists() {
+            // write text to the desktop file
+            let mut file = std::fs::File::create(&file)?;
+            file.write_all(
+                format!(
+                    "
+    [Desktop Entry]
+    Type=Application
+    Exec={app_name} --tray
+    NoDisplay=false
+            "
+                )
+                .as_bytes(),
+            )?;
+        }
+        */
+    Ok(())
+}
+
+pub struct WallPaperRemover {
+    old_path: String,
+    old_path_dark: Option<String>, // ubuntu 22.04 light/dark theme have different uri
+}
+
+impl WallPaperRemover {
+    pub fn new() -> ResultType<Self> {
+        let start = std::time::Instant::now();
+        let old_path = wallpaper::get().map_err(|e| anyhow!(e.to_string()))?;
+        let old_path_dark = wallpaper::get_dark().ok();
+        if old_path.is_empty() && old_path_dark.clone().unwrap_or_default().is_empty() {
+            bail!("already solid color");
+        }
+        wallpaper::set_from_path("").map_err(|e| anyhow!(e.to_string()))?;
+        wallpaper::set_dark_from_path("").ok();
+        log::info!(
+            "created wallpaper remover,  old_path: {:?}, old_path_dark: {:?}, elapsed: {:?}",
+            old_path,
+            old_path_dark,
+            start.elapsed(),
+        );
+        Ok(Self {
+            old_path,
+            old_path_dark,
+        })
+    }
+
+    pub fn support() -> bool {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        if wallpaper::gnome::is_compliant(&desktop) || desktop.as_str() == "XFCE" {
+            return wallpaper::get().is_ok();
+        }
+        false
+    }
+}
+
+impl Drop for WallPaperRemover {
+    fn drop(&mut self) {
+        allow_err!(wallpaper::set_from_path(&self.old_path).map_err(|e| anyhow!(e.to_string())));
+        if let Some(old_path_dark) = &self.old_path_dark {
+            allow_err!(wallpaper::set_dark_from_path(old_path_dark.as_str())
+                .map_err(|e| anyhow!(e.to_string())));
+        }
+    }
+}
+
+#[inline]
+pub fn is_x11() -> bool {
+    *IS_X11
+}
+
+#[inline]
+pub fn is_selinux_enforcing() -> bool {
+    match run_cmds("getenforce") {
+        Ok(output) => output.trim() == "Enforcing",
+        Err(_) => match run_cmds("sestatus") {
+            Ok(output) => {
+                for line in output.lines() {
+                    if line.contains("Current mode:") {
+                        return line.contains("enforcing");
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        },
+    }
 }

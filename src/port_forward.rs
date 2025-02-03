@@ -75,13 +75,13 @@ pub async fn listen(
                         let interface = interface.clone();
                         tokio::spawn(async move {
                             if let Err(err) = run_forward(forward, stream).await {
-                               interface.msgbox("error", "Error", &err.to_string(), "");
+                                interface.msgbox("error", "Error", &err.to_string(), "");
                             }
                             log::info!("connection from {:?} closed", addr);
                        });
                     }
                     Err(err) => {
-                        interface.msgbox("error", "Error", &err.to_string(), "");
+                        interface.on_establish_connection_error(err.to_string());
                     }
                     _ => {}
                 }
@@ -92,6 +92,7 @@ pub async fn listen(
                         break;
                     }
                     Some(Data::NewRDP) => {
+                        println!("receive run_rdp from ui_receiver");
                         run_rdp(addr.port());
                     }
                     _ => {}
@@ -112,52 +113,19 @@ async fn connect_and_login(
     token: &str,
     is_rdp: bool,
 ) -> ResultType<Option<Stream>> {
-    let mut res = connect_and_login_2(
-        id,
-        password,
-        ui_receiver,
-        interface.clone(),
-        forward,
-        key,
-        token,
-        is_rdp,
-    )
-    .await;
-    if res.is_err() && interface.is_force_relay() {
-        res = connect_and_login_2(
-            id,
-            password,
-            ui_receiver,
-            interface,
-            forward,
-            key,
-            token,
-            is_rdp,
-        )
-        .await;
-    }
-    res
-}
-
-async fn connect_and_login_2(
-    id: &str,
-    password: &str,
-    ui_receiver: &mut mpsc::UnboundedReceiver<Data>,
-    interface: impl Interface,
-    forward: &mut Framed<TcpStream, BytesCodec>,
-    key: &str,
-    token: &str,
-    is_rdp: bool,
-) -> ResultType<Option<Stream>> {
     let conn_type = if is_rdp {
         ConnType::RDP
     } else {
         ConnType::PORT_FORWARD
     };
-    let (mut stream, direct) = Client::start(id, key, token, conn_type, interface.clone()).await?;
-    let mut interface = interface;
+    let ((mut stream, direct, _pk), (feedback, rendezvous_server)) =
+        Client::start(id, key, token, conn_type, interface.clone()).await?;
+    interface.update_direct(Some(direct));
     let mut buffer = Vec::new();
     let mut received = false;
+
+    let _keep_it = hc_connection(feedback, rendezvous_server, token).await;
+
     loop {
         tokio::select! {
             res = timeout(READ_TIMEOUT, stream.next()) => match res {
@@ -165,7 +133,10 @@ async fn connect_and_login_2(
                     bail!("Timeout");
                 }
                 Ok(Some(Ok(bytes))) => {
-                    received = true;
+                    if !received {
+                        received = true;
+                        interface.update_received(true);
+                    }
                     let msg_in = Message::parse_from_bytes(&bytes)?;
                     match msg_in.union {
                         Some(message::Union::Hash(hash)) => {
@@ -173,8 +144,9 @@ async fn connect_and_login_2(
                         }
                         Some(message::Union::LoginResponse(lr)) => match lr.union {
                             Some(login_response::Union::Error(err)) => {
-                                interface.handle_login_error(&err);
-                                return Ok(None);
+                                if !interface.handle_login_error(&err) {
+                                    return Ok(None);
+                                }
                             }
                             Some(login_response::Union::PeerInfo(pi)) => {
                                 interface.handle_peer_info(pi);
@@ -189,8 +161,6 @@ async fn connect_and_login_2(
                     }
                 }
                 Ok(Some(Err(err))) => {
-                    log::error!("Connection closed: {}", err);
-                    interface.set_force_relay(direct, received);
                     bail!("Connection closed: {}", err);
                 }
                 _ => {
@@ -199,8 +169,11 @@ async fn connect_and_login_2(
             },
             d = ui_receiver.recv() => {
                 match d {
-                    Some(Data::Login((password, remember))) => {
-                        interface.handle_login_from_ui(password, remember, &mut stream).await;
+                    Some(Data::Login((os_username, os_password, password, remember))) => {
+                        interface.handle_login_from_ui(os_username, os_password, password, remember, &mut stream).await;
+                    }
+                    Some(Data::Message(msg)) => {
+                        allow_err!(stream.send(&msg).await);
                     }
                     _ => {}
                 }

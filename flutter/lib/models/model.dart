@@ -1,27 +1,39 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:bot_toast/bot_toast.dart';
+import 'package:desktop_multi_window/desktop_multi_window.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_hbb/common/widgets/peers_view.dart';
 import 'package:flutter_hbb/consts.dart';
-import 'package:flutter_hbb/generated_bridge.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
 import 'package:flutter_hbb/models/chat_model.dart';
+import 'package:flutter_hbb/models/cm_file_model.dart';
 import 'package:flutter_hbb/models/file_model.dart';
 import 'package:flutter_hbb/models/group_model.dart';
+import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/user_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
+import 'package:flutter_hbb/models/desktop_render_texture.dart';
+import 'package:flutter_hbb/plugin/event.dart';
+import 'package:flutter_hbb/plugin/manager.dart';
+import 'package:flutter_hbb/plugin/widgets/desc_ui.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
+import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:tuple/tuple.dart';
 import 'package:image/image.dart' as img2;
-import 'package:flutter_custom_cursor/cursor_manager.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
+import 'package:uuid/uuid.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../common.dart';
 import '../utils/image.dart' as img;
@@ -29,13 +41,67 @@ import '../common/widgets/dialog.dart';
 import 'input_model.dart';
 import 'platform_model.dart';
 
+import 'package:flutter_hbb/generated_bridge.dart'
+    if (dart.library.html) 'package:flutter_hbb/web/bridge.dart';
+import 'package:flutter_hbb/native/custom_cursor.dart'
+    if (dart.library.html) 'package:flutter_hbb/web/custom_cursor.dart';
+
 typedef HandleMsgBox = Function(Map<String, dynamic> evt, String id);
-typedef ReconnectHandle = Function(OverlayDialogManager, String, bool);
-final _waitForImage = <String, bool>{};
+typedef ReconnectHandle = Function(OverlayDialogManager, SessionID, bool);
+final _constSessionId = Uuid().v4obj();
+
+class CachedPeerData {
+  Map<String, dynamic> updatePrivacyMode = {};
+  Map<String, dynamic> peerInfo = {};
+  List<Map<String, dynamic>> cursorDataList = [];
+  Map<String, dynamic> lastCursorId = {};
+  Map<String, bool> permissions = {};
+
+  bool secure = false;
+  bool direct = false;
+
+  CachedPeerData();
+
+  @override
+  String toString() {
+    return jsonEncode({
+      'updatePrivacyMode': updatePrivacyMode,
+      'peerInfo': peerInfo,
+      'cursorDataList': cursorDataList,
+      'lastCursorId': lastCursorId,
+      'permissions': permissions,
+      'secure': secure,
+      'direct': direct,
+    });
+  }
+
+  static CachedPeerData? fromString(String s) {
+    try {
+      final map = jsonDecode(s);
+      final data = CachedPeerData();
+      data.updatePrivacyMode = map['updatePrivacyMode'];
+      data.peerInfo = map['peerInfo'];
+      for (final cursorData in map['cursorDataList']) {
+        data.cursorDataList.add(cursorData);
+      }
+      data.lastCursorId = map['lastCursorId'];
+      map['permissions'].forEach((key, value) {
+        data.permissions[key] = value;
+      });
+      data.secure = map['secure'];
+      data.direct = map['direct'];
+      return data;
+    } catch (e) {
+      debugPrint('Failed to parse CachedPeerData: $e');
+      return null;
+    }
+  }
+}
 
 class FfiModel with ChangeNotifier {
+  CachedPeerData cachedPeerData = CachedPeerData();
   PeerInfo _pi = PeerInfo();
-  Display _display = Display();
+  Rect? _rect;
 
   var _inputBlocked = false;
   final _permissions = <String, bool>{};
@@ -46,10 +112,26 @@ class FfiModel with ChangeNotifier {
   var _reconnects = 1;
   bool _viewOnly = false;
   WeakReference<FFI> parent;
+  late final SessionID sessionId;
+
+  RxBool waitForImageDialogShow = true.obs;
+  Timer? waitForImageTimer;
+  RxBool waitForFirstImage = true.obs;
+  bool isRefreshing = false;
+
+  Rect? get rect => _rect;
+  bool get isOriginalResolutionSet =>
+      _pi.tryGetDisplayIfNotAllDisplay()?.isOriginalResolutionSet ?? false;
+  bool get isVirtualDisplayResolution =>
+      _pi.tryGetDisplayIfNotAllDisplay()?.isVirtualDisplayResolution ?? false;
+  bool get isOriginalResolution =>
+      _pi.tryGetDisplayIfNotAllDisplay()?.isOriginalResolution ?? false;
 
   Map<String, bool> get permissions => _permissions;
-
-  Display get display => _display;
+  setPermissions(Map<String, bool> permissions) {
+    _permissions.clear();
+    _permissions.addAll(permissions);
+  }
 
   bool? get secure => _secure;
 
@@ -62,6 +144,7 @@ class FfiModel with ChangeNotifier {
   bool get touchMode => _touchMode;
 
   bool get isPeerAndroid => _pi.platform == kPeerPlatformAndroid;
+  bool get isPeerMobile => isPeerAndroid;
 
   bool get viewOnly => _viewOnly;
 
@@ -71,6 +154,35 @@ class FfiModel with ChangeNotifier {
 
   FfiModel(this.parent) {
     clear();
+    sessionId = parent.target!.sessionId;
+    cachedPeerData.permissions = _permissions;
+  }
+
+  Rect? globalDisplaysRect() => _getDisplaysRect(_pi.displays, true);
+  Rect? displaysRect() => _getDisplaysRect(_pi.getCurDisplays(), false);
+  Rect? _getDisplaysRect(List<Display> displays, bool useDisplayScale) {
+    if (displays.isEmpty) {
+      return null;
+    }
+    int scale(int len, double s) {
+      if (useDisplayScale) {
+        return len.toDouble() ~/ s;
+      } else {
+        return len;
+      }
+    }
+
+    double l = displays[0].x;
+    double t = displays[0].y;
+    double r = displays[0].x + scale(displays[0].width, displays[0].scale);
+    double b = displays[0].y + scale(displays[0].height, displays[0].scale);
+    for (var display in displays.sublist(1)) {
+      l = min(l, display.x);
+      t = min(t, display.y);
+      r = max(r, display.x + scale(display.width, display.scale));
+      b = max(b, display.y + scale(display.height, display.scale));
+    }
+    return Rect.fromLTRB(l, t, r, b);
   }
 
   toggleTouchMode() {
@@ -86,27 +198,29 @@ class FfiModel with ChangeNotifier {
       _permissions[k] = v == 'true';
     });
     // Only inited at remote page
-    if (desktopType == DesktopType.remote) {
+    if (parent.target?.connType == ConnType.defaultConn) {
       KeyboardEnabledState.find(id).value = _permissions['keyboard'] != false;
     }
-    debugPrint('$_permissions');
+    debugPrint('updatePermission: $_permissions');
     notifyListeners();
   }
 
-  bool keyboard() => _permissions['keyboard'] != false;
+  bool get keyboard => _permissions['keyboard'] != false;
 
   clear() {
     _pi = PeerInfo();
-    _display = Display();
     _secure = null;
     _direct = null;
     _inputBlocked = false;
     _timer?.cancel();
     _timer = null;
     clearPermissions();
+    waitForImageTimer?.cancel();
   }
 
   setConnectionType(String peerId, bool secure, bool direct) {
+    cachedPeerData.secure = secure;
+    cachedPeerData.direct = direct;
     _secure = secure;
     _direct = direct;
     try {
@@ -133,24 +247,54 @@ class FfiModel with ChangeNotifier {
     _permissions.clear();
   }
 
-  StreamEventHandler startEventListener(String peerId) {
+  handleCachedPeerData(CachedPeerData data, String peerId) async {
+    handleMsgBox({
+      'type': 'success',
+      'title': 'Successful',
+      'text': kMsgboxTextWaitingForImage,
+      'link': '',
+    }, sessionId, peerId);
+    updatePrivacyMode(data.updatePrivacyMode, sessionId, peerId);
+    setConnectionType(peerId, data.secure, data.direct);
+    await handlePeerInfo(data.peerInfo, peerId, true);
+    for (final element in data.cursorDataList) {
+      updateLastCursorId(element);
+      await handleCursorData(element);
+    }
+    if (data.lastCursorId.isNotEmpty) {
+      updateLastCursorId(data.lastCursorId);
+      handleCursorId(data.lastCursorId);
+    }
+  }
+
+  // todo: why called by two position
+  StreamEventHandler startEventListener(SessionID sessionId, String peerId) {
     return (evt) async {
       var name = evt['name'];
       if (name == 'msgbox') {
-        handleMsgBox(evt, peerId);
+        handleMsgBox(evt, sessionId, peerId);
+      } else if (name == 'toast') {
+        handleToast(evt, sessionId, peerId);
+      } else if (name == 'set_multiple_windows_session') {
+        handleMultipleWindowsSession(evt, sessionId, peerId);
       } else if (name == 'peer_info') {
-        handlePeerInfo(evt, peerId);
+        handlePeerInfo(evt, peerId, false);
       } else if (name == 'sync_peer_info') {
-        handleSyncPeerInfo(evt, peerId);
+        handleSyncPeerInfo(evt, sessionId, peerId);
+      } else if (name == 'sync_platform_additions') {
+        handlePlatformAdditions(evt, sessionId, peerId);
       } else if (name == 'connection_ready') {
         setConnectionType(
             peerId, evt['secure'] == 'true', evt['direct'] == 'true');
       } else if (name == 'switch_display') {
-        handleSwitchDisplay(evt, peerId);
+        // switch display is kept for backward compatibility
+        handleSwitchDisplay(evt, sessionId, peerId);
       } else if (name == 'cursor_data') {
-        await parent.target?.cursorModel.updateCursorData(evt);
+        updateLastCursorId(evt);
+        await handleCursorData(evt);
       } else if (name == 'cursor_id') {
-        await parent.target?.cursorModel.updateCursorId(evt);
+        updateLastCursorId(evt);
+        handleCursorId(evt);
       } else if (name == 'cursor_position') {
         await parent.target?.cursorModel.updateCursorPosition(evt, peerId);
       } else if (name == 'clipboard') {
@@ -165,11 +309,18 @@ class FfiModel with ChangeNotifier {
             .receive(int.parse(evt['id'] as String), evt['text'] ?? '');
       } else if (name == 'file_dir') {
         parent.target?.fileModel.receiveFileDir(evt);
+      } else if (name == 'empty_dirs') {
+        parent.target?.fileModel.receiveEmptyDirs(evt);
       } else if (name == 'job_progress') {
         parent.target?.fileModel.jobController.tryUpdateJobProgress(evt);
       } else if (name == 'job_done') {
-        parent.target?.fileModel.jobController.jobDone(evt);
-        parent.target?.fileModel.refreshAll();
+        bool? refresh =
+            await parent.target?.fileModel.jobController.jobDone(evt);
+        if (refresh == true) {
+          // many job done for delete directory
+          // todo: refresh may not work when confirm delete local directory
+          parent.target?.fileModel.refreshAll();
+        }
       } else if (name == 'job_error') {
         parent.target?.fileModel.jobController.jobError(evt);
       } else if (name == 'override_file_confirm') {
@@ -187,102 +338,236 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'update_block_input_state') {
         updateBlockInputState(evt, peerId);
       } else if (name == 'update_privacy_mode') {
-        updatePrivacyMode(evt, peerId);
-      } else if (name == 'new_connection') {
-        var uni_links = evt['uni_links'].toString();
-        if (uni_links.startsWith(kUniLinksPrefix)) {
-          parseRustdeskUri(uni_links);
-        }
-      } else if (name == 'alias') {
-        handleAliasChanged(evt);
+        updatePrivacyMode(evt, sessionId, peerId);
       } else if (name == 'show_elevation') {
         final show = evt['show'].toString() == 'true';
         parent.target?.serverModel.setShowElevation(show);
       } else if (name == 'cancel_msgbox') {
-        cancelMsgBox(evt, peerId);
+        cancelMsgBox(evt, sessionId);
       } else if (name == 'switch_back') {
         final peer_id = evt['peer_id'].toString();
-        await bind.sessionSwitchSides(id: peer_id);
+        await bind.sessionSwitchSides(sessionId: sessionId);
         closeConnection(id: peer_id);
       } else if (name == 'portable_service_running') {
-        parent.target?.elevationModel.onPortableServiceRunning(evt);
-      } else if (name == "on_url_scheme_received") {
-        final url = evt['url'].toString();
-        parseRustdeskUri(url);
-      } else if (name == "on_voice_call_waiting") {
+        _handlePortableServiceRunning(peerId, evt);
+      } else if (name == 'on_url_scheme_received') {
+        // currently comes from "_url" ipc of mac and dbus of linux
+        onUrlSchemeReceived(evt);
+      } else if (name == 'on_voice_call_waiting') {
         // Waiting for the response from the peer.
         parent.target?.chatModel.onVoiceCallWaiting();
-      } else if (name == "on_voice_call_started") {
+      } else if (name == 'on_voice_call_started') {
         // Voice call is connected.
         parent.target?.chatModel.onVoiceCallStarted();
-      } else if (name == "on_voice_call_closed") {
+      } else if (name == 'on_voice_call_closed') {
         // Voice call is closed with reason.
         final reason = evt['reason'].toString();
         parent.target?.chatModel.onVoiceCallClosed(reason);
-      } else if (name == "on_voice_call_incoming") {
+      } else if (name == 'on_voice_call_incoming') {
         // Voice call is requested by the peer.
         parent.target?.chatModel.onVoiceCallIncoming();
-      } else if (name == "update_voice_call_state") {
+      } else if (name == 'update_voice_call_state') {
         parent.target?.serverModel.updateVoiceCallState(evt);
+      } else if (name == 'fingerprint') {
+        FingerprintState.find(peerId).value = evt['fingerprint'] ?? '';
+      } else if (name == 'plugin_manager') {
+        pluginManager.handleEvent(evt);
+      } else if (name == 'plugin_event') {
+        handlePluginEvent(evt,
+            (Map<String, dynamic> e) => handleMsgBox(e, sessionId, peerId));
+      } else if (name == 'plugin_reload') {
+        handleReloading(evt);
+      } else if (name == 'plugin_option') {
+        handleOption(evt);
+      } else if (name == "sync_peer_hash_password_to_personal_ab") {
+        if (desktopType == DesktopType.main || isWeb || isMobile) {
+          final id = evt['id'];
+          final hash = evt['hash'];
+          if (id != null && hash != null) {
+            gFFI.abModel
+                .changePersonalHashPassword(id.toString(), hash.toString());
+          }
+        }
+      } else if (name == "cm_file_transfer_log") {
+        if (isDesktop) {
+          gFFI.cmFileModel.onFileTransferLog(evt);
+        }
+      } else if (name == 'sync_peer_option') {
+        _handleSyncPeerOption(evt, peerId);
+      } else if (name == 'follow_current_display') {
+        handleFollowCurrentDisplay(evt, sessionId, peerId);
+      } else if (name == 'use_texture_render') {
+        _handleUseTextureRender(evt, sessionId, peerId);
+      } else if (name == "selected_files") {
+        if (isWeb) {
+          parent.target?.fileModel.onSelectedFiles(evt);
+        }
+      } else if (name == "send_emptry_dirs") {
+        if (isWeb) {
+          parent.target?.fileModel.sendEmptyDirs(evt);
+        }
+      } else if (name == "record_status") {
+        if (desktopType == DesktopType.remote || isMobile) {
+          parent.target?.recordingModel.updateStatus(evt['start'] == 'true');
+        }
       } else {
-        debugPrint("Unknown event name: $name");
+        debugPrint('Event is not handled in the fixed branch: $name');
       }
     };
   }
 
+  _handleUseTextureRender(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+    parent.target?.imageModel.setUseTextureRender(evt['v'] == 'Y');
+    waitForFirstImage.value = true;
+    isRefreshing = true;
+    showConnectedWaitingForImage(parent.target!.dialogManager, sessionId,
+        'success', 'Successful', kMsgboxTextWaitingForImage);
+  }
+
+  _handleSyncPeerOption(Map<String, dynamic> evt, String peer) {
+    final k = evt['k'];
+    final v = evt['v'];
+    if (k == kOptionToggleViewOnly) {
+      setViewOnly(peer, v as bool);
+    } else if (k == 'keyboard_mode') {
+      parent.target?.inputModel.updateKeyboardMode();
+    } else if (k == 'input_source') {
+      stateGlobal.getInputSource(force: true);
+    }
+  }
+
+  onUrlSchemeReceived(Map<String, dynamic> evt) {
+    final url = evt['url'].toString().trim();
+    if (url.startsWith(bind.mainUriPrefixSync()) &&
+        handleUriLink(uriString: url)) {
+      return;
+    }
+    switch (url) {
+      case kUrlActionClose:
+        debugPrint("closing all instances");
+        Future.microtask(() async {
+          await rustDeskWinManager.closeAllSubWindows();
+          windowManager.close();
+        });
+        break;
+      default:
+        windowOnTop(null);
+        break;
+    }
+  }
+
   /// Bind the event listener to receive events from the Rust core.
-  updateEventListener(String peerId) {
-    platformFFI.setEventCallback(startEventListener(peerId));
+  updateEventListener(SessionID sessionId, String peerId) {
+    platformFFI.setEventCallback(startEventListener(sessionId, peerId));
+  }
+
+  _handlePortableServiceRunning(String peerId, Map<String, dynamic> evt) {
+    final running = evt['running'] == 'true';
+    parent.target?.elevationModel.onPortableServiceRunning(running);
   }
 
   handleAliasChanged(Map<String, dynamic> evt) {
-    final rxAlias = PeerStringOption.find(evt['id'], 'alias');
-    if (rxAlias.value != evt['alias']) {
-      rxAlias.value = evt['alias'];
+    if (!(isDesktop || isWebDesktop)) return;
+    final String peerId = evt['id'];
+    final String alias = evt['alias'];
+    String label = getDesktopTabLabel(peerId, alias);
+    final rxTabLabel = PeerStringOption.find(evt['id'], 'tabLabel');
+    if (rxTabLabel.value != label) {
+      rxTabLabel.value = label;
     }
   }
 
-  _updateCurDisplay(String peerId, Display newDisplay) {
-    if (newDisplay != _display) {
-      if (newDisplay.x != _display.x || newDisplay.y != _display.y) {
-        parent.target?.cursorModel
-            .updateDisplayOrigin(newDisplay.x, newDisplay.y);
+  updateCurDisplay(SessionID sessionId, {updateCursorPos = false}) {
+    final newRect = displaysRect();
+    if (newRect == null) {
+      return;
+    }
+    if (newRect != _rect) {
+      if (newRect.left != _rect?.left || newRect.top != _rect?.top) {
+        parent.target?.cursorModel.updateDisplayOrigin(
+            newRect.left, newRect.top,
+            updateCursorPos: updateCursorPos);
       }
-      _display = newDisplay;
-      _updateSessionWidthHeight(peerId);
+      _rect = newRect;
+      parent.target?.canvasModel
+          .updateViewStyle(refreshMousePos: updateCursorPos);
+      _updateSessionWidthHeight(sessionId);
     }
   }
 
-  handleSwitchDisplay(Map<String, dynamic> evt, String peerId) {
-    _pi.currentDisplay = int.parse(evt['display']);
-    var newDisplay = Display();
-    newDisplay.x = double.parse(evt['x']);
-    newDisplay.y = double.parse(evt['y']);
-    newDisplay.width = int.parse(evt['width']);
-    newDisplay.height = int.parse(evt['height']);
-    newDisplay.cursorEmbedded = int.parse(evt['cursor_embedded']) == 1;
+  handleSwitchDisplay(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+    final display = int.parse(evt['display']);
 
-    _updateCurDisplay(peerId, newDisplay);
-
-    try {
-      CurrentDisplayState.find(peerId).value = _pi.currentDisplay;
-    } catch (e) {
-      //
+    if (_pi.currentDisplay != kAllDisplayValue) {
+      if (bind.peerGetDefaultSessionsCount(id: peerId) > 1) {
+        if (display != _pi.currentDisplay) {
+          return;
+        }
+      }
+      if (!_pi.isSupportMultiUiSession) {
+        _pi.currentDisplay = display;
+      }
+      // If `isSupportMultiUiSession` is true, the switch display message should not be used to update current display.
+      // It is only used to update the display info.
     }
-    parent.target?.recordingModel.onSwitchDisplay();
-    handleResolutions(peerId, evt["resolutions"]);
+
+    var newDisplay = Display();
+    newDisplay.x = double.tryParse(evt['x']) ?? newDisplay.x;
+    newDisplay.y = double.tryParse(evt['y']) ?? newDisplay.y;
+    newDisplay.width = int.tryParse(evt['width']) ?? newDisplay.width;
+    newDisplay.height = int.tryParse(evt['height']) ?? newDisplay.height;
+    newDisplay.cursorEmbedded = int.tryParse(evt['cursor_embedded']) == 1;
+    newDisplay.originalWidth = int.tryParse(
+            evt['original_width'] ?? kInvalidResolutionValue.toString()) ??
+        kInvalidResolutionValue;
+    newDisplay.originalHeight = int.tryParse(
+            evt['original_height'] ?? kInvalidResolutionValue.toString()) ??
+        kInvalidResolutionValue;
+    newDisplay._scale = _pi.scaleOfDisplay(display);
+    _pi.displays[display] = newDisplay;
+
+    if (!_pi.isSupportMultiUiSession || _pi.currentDisplay == display) {
+      updateCurDisplay(sessionId);
+    }
+
+    if (!_pi.isSupportMultiUiSession) {
+      try {
+        CurrentDisplayState.find(peerId).value = display;
+      } catch (e) {
+        //
+      }
+    }
+
+    if (!_pi.isSupportMultiUiSession || _pi.currentDisplay == display) {
+      handleResolutions(peerId, evt['resolutions']);
+    }
     notifyListeners();
   }
 
-  cancelMsgBox(Map<String, dynamic> evt, String id) {
+  cancelMsgBox(Map<String, dynamic> evt, SessionID sessionId) {
     if (parent.target == null) return;
     final dialogManager = parent.target!.dialogManager;
-    final tag = '$id-${evt['tag']}';
+    final tag = '$sessionId-${evt['tag']}';
     dialogManager.dismissByTag(tag);
   }
 
+  handleMultipleWindowsSession(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+    if (parent.target == null) return;
+    final dialogManager = parent.target!.dialogManager;
+    final sessions = evt['windows_sessions'];
+    final title = translate('Multiple Windows sessions found');
+    final text = translate('Please select the session you want to connect to');
+    final type = "";
+
+    showWindowsSessionsDialog(
+        type, title, text, dialogManager, sessionId, peerId, sessions);
+  }
+
   /// Handle the message box event based on [evt] and [id].
-  handleMsgBox(Map<String, dynamic> evt, String id) {
+  handleMsgBox(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
     if (parent.target == null) return;
     final dialogManager = parent.target!.dialogManager;
     final type = evt['type'];
@@ -290,43 +575,84 @@ class FfiModel with ChangeNotifier {
     final text = evt['text'];
     final link = evt['link'];
     if (type == 're-input-password') {
-      wrongPasswordDialog(id, dialogManager, type, title, text);
+      wrongPasswordDialog(sessionId, dialogManager, type, title, text);
+    } else if (type == 'input-2fa') {
+      enter2FaDialog(sessionId, dialogManager);
     } else if (type == 'input-password') {
-      enterPasswordDialog(id, dialogManager);
-    } else if (type == 'xsession-login' || type == 'xsession-re-login') {
-      // to-do
-    } else if (type == 'xsession-login-password' ||
-        type == 'xsession-login-password') {
-      // to-do
+      enterPasswordDialog(sessionId, dialogManager);
+    } else if (type == 'session-login' || type == 'session-re-login') {
+      enterUserLoginDialog(sessionId, dialogManager);
+    } else if (type == 'session-login-password' ||
+        type == 'session-login-password') {
+      enterUserLoginAndPasswordDialog(sessionId, dialogManager);
     } else if (type == 'restarting') {
-      showMsgBox(id, type, title, text, link, false, dialogManager,
+      showMsgBox(sessionId, type, title, text, link, false, dialogManager,
           hasCancel: false);
     } else if (type == 'wait-remote-accept-nook') {
-      showWaitAcceptDialog(id, type, title, text, dialogManager);
+      showWaitAcceptDialog(sessionId, type, title, text, dialogManager);
     } else if (type == 'on-uac' || type == 'on-foreground-elevated') {
-      showOnBlockDialog(id, type, title, text, dialogManager);
+      showOnBlockDialog(sessionId, type, title, text, dialogManager);
     } else if (type == 'wait-uac') {
-      showWaitUacDialog(id, dialogManager, type);
+      showWaitUacDialog(sessionId, dialogManager, type);
     } else if (type == 'elevation-error') {
-      showElevationError(id, type, title, text, dialogManager);
-    } else if (type == "relay-hint") {
-      showRelayHintDialog(id, type, title, text, dialogManager);
+      showElevationError(sessionId, type, title, text, dialogManager);
+    } else if (type == 'relay-hint' || type == 'relay-hint2') {
+      showRelayHintDialog(sessionId, type, title, text, dialogManager, peerId);
+    } else if (text == kMsgboxTextWaitingForImage) {
+      showConnectedWaitingForImage(dialogManager, sessionId, type, title, text);
+    } else if (title == 'Privacy mode') {
+      final hasRetry = evt['hasRetry'] == 'true';
+      showPrivacyFailedDialog(
+          sessionId, type, title, text, link, hasRetry, dialogManager);
     } else {
-      var hasRetry = evt['hasRetry'] == 'true';
-      showMsgBox(id, type, title, text, link, hasRetry, dialogManager);
+      final hasRetry = evt['hasRetry'] == 'true';
+      showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
+    }
+  }
+
+  handleToast(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+    final type = evt['type'] ?? 'info';
+    final text = evt['text'] ?? '';
+    final durMsc = evt['dur_msec'] ?? 2000;
+    final duration = Duration(milliseconds: durMsc);
+    if ((text).isEmpty) {
+      BotToast.showLoading(
+        duration: duration,
+        clickClose: true,
+        allowClick: true,
+      );
+    } else {
+      if (type.contains('error')) {
+        BotToast.showText(
+          contentColor: Colors.red,
+          text: translate(text),
+          duration: duration,
+          clickClose: true,
+          onlyOne: true,
+        );
+      } else {
+        BotToast.showText(
+          text: translate(text),
+          duration: duration,
+          clickClose: true,
+          onlyOne: true,
+        );
+      }
     }
   }
 
   /// Show a message box with [type], [title] and [text].
-  showMsgBox(String id, String type, String title, String text, String link,
-      bool hasRetry, OverlayDialogManager dialogManager,
+  showMsgBox(SessionID sessionId, String type, String title, String text,
+      String link, bool hasRetry, OverlayDialogManager dialogManager,
       {bool? hasCancel}) {
-    msgBox(id, type, title, text, link, dialogManager,
-        hasCancel: hasCancel, reconnect: reconnect);
+    msgBox(sessionId, type, title, text, link, dialogManager,
+        hasCancel: hasCancel,
+        reconnect: hasRetry ? reconnect : null,
+        reconnectTimeout: hasRetry ? _reconnects : null);
     _timer?.cancel();
     if (hasRetry) {
       _timer = Timer(Duration(seconds: _reconnects), () {
-        reconnect(dialogManager, id, false);
+        reconnect(dialogManager, sessionId, false);
       });
       _reconnects *= 2;
     } else {
@@ -334,17 +660,18 @@ class FfiModel with ChangeNotifier {
     }
   }
 
-  void reconnect(
-      OverlayDialogManager dialogManager, String id, bool forceRelay) {
-    bind.sessionReconnect(id: id, forceRelay: forceRelay);
+  void reconnect(OverlayDialogManager dialogManager, SessionID sessionId,
+      bool forceRelay) {
+    bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
     clearPermissions();
+    dialogManager.dismissAll();
     dialogManager.showLoading(translate('Connecting...'),
         onCancel: closeConnection);
   }
 
-  void showRelayHintDialog(String id, String type, String title, String text,
-      OverlayDialogManager dialogManager) {
-    dialogManager.show(tag: '$id-$type', (setState, close) {
+  void showRelayHintDialog(SessionID sessionId, String type, String title,
+      String text, OverlayDialogManager dialogManager, String peerId) {
+    dialogManager.show(tag: '$sessionId-$type', (setState, close, context) {
       onClose() {
         closeConnection();
         close();
@@ -352,51 +679,139 @@ class FfiModel with ChangeNotifier {
 
       final style =
           ElevatedButton.styleFrom(backgroundColor: Colors.green[700]);
+      var hint = "\n\n${translate('relay_hint_tip')}";
+      if (text.contains("10054") || text.contains("104")) {
+        hint = "";
+      }
       return CustomAlertDialog(
         title: null,
-        content: msgboxContent(type, title,
-            "${translate(text)}\n\n${translate('relay_hint_tip')}"),
+        content: msgboxContent(type, title, "${translate(text)}$hint"),
         actions: [
           dialogButton('Close', onPressed: onClose, isOutline: true),
+          if (type == 'relay-hint')
+            dialogButton('Connect via relay',
+                onPressed: () => reconnect(dialogManager, sessionId, true),
+                buttonStyle: style,
+                isOutline: true),
           dialogButton('Retry',
-              onPressed: () => reconnect(dialogManager, id, false)),
-          dialogButton('Connect via relay',
-              onPressed: () => reconnect(dialogManager, id, true),
-              buttonStyle: style),
-          dialogButton('Always connect via relay', onPressed: () {
-            const option = 'force-always-relay';
-            bind.sessionPeerOption(
-                id: id, name: option, value: bool2option(option, true));
-            reconnect(dialogManager, id, true);
-          }, buttonStyle: style),
+              onPressed: () => reconnect(dialogManager, sessionId, false)),
+          if (type == 'relay-hint2')
+            dialogButton('Connect via relay',
+                onPressed: () => reconnect(dialogManager, sessionId, true),
+                buttonStyle: style),
         ],
         onCancel: onClose,
       );
     });
   }
 
-  _updateSessionWidthHeight(String id) {
-    parent.target?.canvasModel.updateViewStyle();
-    if (display.width <= 0 || display.height <= 0) {
-      debugPrintStack(
-          label: 'invalid display size (${display.width},${display.height})');
+  void showConnectedWaitingForImage(OverlayDialogManager dialogManager,
+      SessionID sessionId, String type, String title, String text) {
+    onClose() {
+      closeConnection();
+    }
+
+    if (waitForFirstImage.isFalse) return;
+    dialogManager.show(
+      (setState, close, context) => CustomAlertDialog(
+          title: null,
+          content: SelectionArea(child: msgboxContent(type, title, text)),
+          actions: [
+            dialogButton("Cancel", onPressed: onClose, isOutline: true)
+          ],
+          onCancel: onClose),
+      tag: '$sessionId-waiting-for-image',
+    );
+    waitForImageDialogShow.value = true;
+    waitForImageTimer = Timer(Duration(milliseconds: 1500), () {
+      if (waitForFirstImage.isTrue && !isRefreshing) {
+        bind.sessionInputOsPassword(sessionId: sessionId, value: '');
+      }
+    });
+    bind.sessionOnWaitingForImageDialogShow(sessionId: sessionId);
+  }
+
+  void showPrivacyFailedDialog(
+      SessionID sessionId,
+      String type,
+      String title,
+      String text,
+      String link,
+      bool hasRetry,
+      OverlayDialogManager dialogManager) {
+    if (text == 'no_need_privacy_mode_no_physical_displays_tip' ||
+        text == 'Enter privacy mode') {
+      // There are display changes on the remote side,
+      // which will cause some messages to refresh the canvas and dismiss dialogs.
+      // So we add a delay here to ensure the dialog is displayed.
+      Future.delayed(Duration(milliseconds: 3000), () {
+        showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
+      });
     } else {
-      bind.sessionSetSize(id: id, width: display.width, height: display.height);
+      showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
+    }
+  }
+
+  _updateSessionWidthHeight(SessionID sessionId) {
+    if (_rect == null) return;
+    if (_rect!.width <= 0 || _rect!.height <= 0) {
+      debugPrintStack(
+          label: 'invalid display size (${_rect!.width},${_rect!.height})');
+    } else {
+      final displays = _pi.getCurDisplays();
+      if (displays.length == 1) {
+        bind.sessionSetSize(
+          sessionId: sessionId,
+          display:
+              pi.currentDisplay == kAllDisplayValue ? 0 : pi.currentDisplay,
+          width: _rect!.width.toInt(),
+          height: _rect!.height.toInt(),
+        );
+      } else {
+        for (int i = 0; i < displays.length; ++i) {
+          bind.sessionSetSize(
+            sessionId: sessionId,
+            display: i,
+            width: displays[i].width.toInt(),
+            height: displays[i].height.toInt(),
+          );
+        }
+      }
     }
   }
 
   /// Handle the peer info event based on [evt].
-  handlePeerInfo(Map<String, dynamic> evt, String peerId) async {
-    // recent peer updated by handle_peer_info(ui_session_interface.rs) --> handle_peer_info(client.rs) --> save_config(client.rs)
+  handlePeerInfo(Map<String, dynamic> evt, String peerId, bool isCache) async {
+    parent.target?.chatModel.voiceCallStatus.value = VoiceCallStatus.notStarted;
+
+    // This call is to ensuer the keyboard mode is updated depending on the peer version.
+    parent.target?.inputModel.updateKeyboardMode();
+
+    // Map clone is required here, otherwise "evt" may be changed by other threads through the reference.
+    // Because this function is asynchronous, there's an "await" in this function.
+    cachedPeerData.peerInfo = {...evt};
+    // Do not cache resolutions, because a new display connection have different resolutions.
+    cachedPeerData.peerInfo.remove('resolutions');
+
+    // Recent peer is updated by handle_peer_info(ui_session_interface.rs) --> handle_peer_info(client.rs) --> save_config(client.rs)
     bind.mainLoadRecentPeers();
 
     parent.target?.dialogManager.dismissAll();
     _pi.version = evt['version'];
+    _pi.isSupportMultiUiSession =
+        bind.isSupportMultiUiSession(version: _pi.version);
     _pi.username = evt['username'];
     _pi.hostname = evt['hostname'];
     _pi.platform = evt['platform'];
     _pi.sasEnabled = evt['sas_enabled'] == 'true';
-    _pi.currentDisplay = int.parse(evt['current_display']);
+    final currentDisplay = int.parse(evt['current_display']);
+    if (_pi.primaryDisplay == kInvalidDisplayIndex) {
+      _pi.primaryDisplay = currentDisplay;
+    }
+
+    if (bind.peerGetDefaultSessionsCount(id: peerId) <= 1) {
+      _pi.currentDisplay = currentDisplay;
+    }
 
     try {
       CurrentDisplayState.find(peerId).value = _pi.currentDisplay;
@@ -405,74 +820,172 @@ class FfiModel with ChangeNotifier {
     }
 
     final connType = parent.target?.connType;
-
     if (isPeerAndroid) {
       _touchMode = true;
-      if (connType == ConnType.defaultConn &&
-          parent.target != null &&
-          parent.target!.ffiModel.permissions['keyboard'] != false) {
-        Timer(
-            const Duration(milliseconds: 100),
-            () => parent.target!.dialogManager
-                .showMobileActionsOverlay(ffi: parent.target!));
-      }
     } else {
-      _touchMode =
-          await bind.sessionGetOption(id: peerId, arg: 'touch-mode') != '';
+      _touchMode = await bind.sessionGetOption(
+              sessionId: sessionId, arg: kOptionTouchMode) !=
+          '';
     }
-
     if (connType == ConnType.fileTransfer) {
       parent.target?.fileModel.onReady();
     } else if (connType == ConnType.defaultConn) {
-      _pi.displays = [];
+      List<Display> newDisplays = [];
       List<dynamic> displays = json.decode(evt['displays']);
       for (int i = 0; i < displays.length; ++i) {
-        Map<String, dynamic> d0 = displays[i];
-        var d = Display();
-        d.x = d0['x'].toDouble();
-        d.y = d0['y'].toDouble();
-        d.width = d0['width'];
-        d.height = d0['height'];
-        d.cursorEmbedded = d0['cursor_embedded'] == 1;
-        _pi.displays.add(d);
+        newDisplays.add(evtToDisplay(displays[i]));
       }
-      stateGlobal.displaysCount.value = _pi.displays.length;
+      _pi.displays.value = newDisplays;
+      _pi.displaysCount.value = _pi.displays.length;
       if (_pi.currentDisplay < _pi.displays.length) {
-        _display = _pi.displays[_pi.currentDisplay];
-        _updateSessionWidthHeight(peerId);
+        // now replaced to _updateCurDisplay
+        updateCurDisplay(sessionId);
       }
       if (displays.isNotEmpty) {
-        parent.target?.dialogManager.showLoading(
-            translate('Connected, waiting for image...'),
-            onCancel: closeConnection);
-        _waitForImage[peerId] = true;
         _reconnects = 1;
+        waitForFirstImage.value = true;
+        isRefreshing = false;
       }
       Map<String, dynamic> features = json.decode(evt['features']);
-      _pi.features.privacyMode = features['privacy_mode'] == 1;
-      handleResolutions(peerId, evt["resolutions"]);
+      _pi.features.privacyMode = features['privacy_mode'] == true;
+      if (!isCache) {
+        handleResolutions(peerId, evt["resolutions"]);
+      }
       parent.target?.elevationModel.onPeerInfo(_pi);
     }
     if (connType == ConnType.defaultConn) {
-      setViewOnly(peerId,
-          bind.sessionGetToggleOptionSync(id: peerId, arg: 'view-only'));
+      setViewOnly(
+          peerId,
+          bind.sessionGetToggleOptionSync(
+              sessionId: sessionId, arg: kOptionToggleViewOnly));
     }
     if (connType == ConnType.defaultConn) {
-      final platform_additions = evt['platform_additions'];
-      if (platform_additions != null && platform_additions != '') {
+      final platformAdditions = evt['platform_additions'];
+      if (platformAdditions != null && platformAdditions != '') {
         try {
-          _pi.platform_additions = json.decode(platform_additions);
+          _pi.platformAdditions = json.decode(platformAdditions);
         } catch (e) {
-          debugPrint('Failed to decode platform_additions $e');
+          debugPrint('Failed to decode platformAdditions $e');
         }
       }
     }
+
+    _pi.isSet.value = true;
+    stateGlobal.resetLastResolutionGroupValues(peerId);
+
+    if (isDesktop || isWebDesktop) {
+      checkDesktopKeyboardMode();
+    }
+
     notifyListeners();
+
+    if (!isCache) {
+      tryUseAllMyDisplaysForTheRemoteSession(peerId);
+    }
+  }
+
+  checkDesktopKeyboardMode() async {
+    if (isInputSourceFlutter) {
+      // Local side, flutter keyboard input source
+      // Currently only map mode is supported, legacy mode is used for compatibility.
+      for (final mode in [kKeyMapMode, kKeyLegacyMode]) {
+        if (bind.sessionIsKeyboardModeSupported(
+            sessionId: sessionId, mode: mode)) {
+          await bind.sessionSetKeyboardMode(sessionId: sessionId, value: mode);
+          break;
+        }
+      }
+    } else {
+      final curMode = await bind.sessionGetKeyboardMode(sessionId: sessionId);
+      if (curMode != null) {
+        if (bind.sessionIsKeyboardModeSupported(
+            sessionId: sessionId, mode: curMode)) {
+          return;
+        }
+      }
+
+      // If current keyboard mode is not supported, change to another one.
+      for (final mode in [kKeyMapMode, kKeyTranslateMode, kKeyLegacyMode]) {
+        if (bind.sessionIsKeyboardModeSupported(
+            sessionId: sessionId, mode: mode)) {
+          bind.sessionSetKeyboardMode(sessionId: sessionId, value: mode);
+          break;
+        }
+      }
+    }
+  }
+
+  tryUseAllMyDisplaysForTheRemoteSession(String peerId) async {
+    if (bind.sessionGetUseAllMyDisplaysForTheRemoteSession(
+            sessionId: sessionId) !=
+        'Y') {
+      return;
+    }
+
+    if (!_pi.isSupportMultiDisplay || _pi.displays.length <= 1) {
+      return;
+    }
+
+    final screenRectList = await getScreenRectList();
+    if (screenRectList.length <= 1) {
+      return;
+    }
+
+    // to-do: peer currentDisplay is the primary display, but the primary display may not be the first display.
+    // local primary display also may not be the first display.
+    //
+    // 0 is assumed to be the primary display here, for now.
+
+    // move to the first display and set fullscreen
+    bind.sessionSwitchDisplay(
+      isDesktop: isDesktop,
+      sessionId: sessionId,
+      value: Int32List.fromList([0]),
+    );
+    _pi.currentDisplay = 0;
+    try {
+      CurrentDisplayState.find(peerId).value = _pi.currentDisplay;
+    } catch (e) {
+      //
+    }
+    await tryMoveToScreenAndSetFullscreen(screenRectList[0]);
+
+    final length = _pi.displays.length < screenRectList.length
+        ? _pi.displays.length
+        : screenRectList.length;
+    for (var i = 1; i < length; i++) {
+      openMonitorInNewTabOrWindow(i, peerId, _pi,
+          screenRect: screenRectList[i]);
+    }
+  }
+
+  tryShowAndroidActionsOverlay({int delayMSecs = 10}) {
+    if (isPeerAndroid) {
+      if (parent.target?.connType == ConnType.defaultConn &&
+          parent.target != null &&
+          parent.target!.ffiModel.permissions['keyboard'] != false) {
+        Timer(Duration(milliseconds: delayMSecs), () {
+          if (parent.target!.dialogManager.mobileActionsOverlayVisible.isTrue) {
+            parent.target!.dialogManager
+                .showMobileActionsOverlay(ffi: parent.target!);
+          }
+        });
+      }
+    }
   }
 
   handleResolutions(String id, dynamic resolutions) {
     try {
-      final List<dynamic> dynamicArray = jsonDecode(resolutions as String);
+      final resolutionsObj = json.decode(resolutions as String);
+      late List<dynamic> dynamicArray;
+      if (resolutionsObj is Map) {
+        // The web version
+        dynamicArray = (resolutionsObj as Map<String, dynamic>)['resolutions']
+            as List<dynamic>;
+      } else {
+        // The rust version
+        dynamicArray = resolutionsObj as List<dynamic>;
+      }
       List<Resolution> arr = List.empty(growable: true);
       for (int i = 0; i < dynamicArray.length; i++) {
         var width = dynamicArray[i]["width"];
@@ -494,28 +1007,154 @@ class FfiModel with ChangeNotifier {
     }
   }
 
+  Display evtToDisplay(Map<String, dynamic> evt) {
+    var d = Display();
+    d.x = evt['x']?.toDouble() ?? d.x;
+    d.y = evt['y']?.toDouble() ?? d.y;
+    d.width = evt['width'] ?? d.width;
+    d.height = evt['height'] ?? d.height;
+    d.cursorEmbedded = evt['cursor_embedded'] == 1;
+    d.originalWidth = evt['original_width'] ?? kInvalidResolutionValue;
+    d.originalHeight = evt['original_height'] ?? kInvalidResolutionValue;
+    double v = (evt['scale']?.toDouble() ?? 100.0) / 100;
+    d._scale = v > 1.0 ? v : 1.0;
+    return d;
+  }
+
+  updateLastCursorId(Map<String, dynamic> evt) {
+    // int.parse(evt['id']) may cause FormatException
+    // Unhandled Exception: FormatException: Positive input exceeds the limit of integer 18446744071749110741
+    parent.target?.cursorModel.id = evt['id'];
+  }
+
+  handleCursorId(Map<String, dynamic> evt) {
+    cachedPeerData.lastCursorId = evt;
+    parent.target?.cursorModel.updateCursorId(evt);
+  }
+
+  handleCursorData(Map<String, dynamic> evt) async {
+    cachedPeerData.cursorDataList.add(evt);
+    await parent.target?.cursorModel.updateCursorData(evt);
+  }
+
   /// Handle the peer info synchronization event based on [evt].
-  handleSyncPeerInfo(Map<String, dynamic> evt, String peerId) async {
+  handleSyncPeerInfo(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
     if (evt['displays'] != null) {
+      cachedPeerData.peerInfo['displays'] = evt['displays'];
       List<dynamic> displays = json.decode(evt['displays']);
       List<Display> newDisplays = [];
       for (int i = 0; i < displays.length; ++i) {
-        Map<String, dynamic> d0 = displays[i];
-        var d = Display();
-        d.x = d0['x'].toDouble();
-        d.y = d0['y'].toDouble();
-        d.width = d0['width'];
-        d.height = d0['height'];
-        d.cursorEmbedded = d0['cursor_embedded'] == 1;
-        newDisplays.add(d);
+        newDisplays.add(evtToDisplay(displays[i]));
       }
-      _pi.displays = newDisplays;
-      stateGlobal.displaysCount.value = _pi.displays.length;
-      if (_pi.currentDisplay >= 0 && _pi.currentDisplay < _pi.displays.length) {
-        _updateCurDisplay(peerId, _pi.displays[_pi.currentDisplay]);
+      _pi.displays.value = newDisplays;
+      _pi.displaysCount.value = _pi.displays.length;
+
+      if (_pi.currentDisplay == kAllDisplayValue) {
+        updateCurDisplay(sessionId);
+        // to-do: What if the displays are changed?
+      } else {
+        if (_pi.currentDisplay >= 0 &&
+            _pi.currentDisplay < _pi.displays.length) {
+          updateCurDisplay(sessionId);
+        } else {
+          if (_pi.displays.isNotEmpty) {
+            // Notify to switch display
+            msgBox(sessionId, 'custom-nook-nocancel-hasclose-info', 'Prompt',
+                'display_is_plugged_out_msg', '', parent.target!.dialogManager);
+            final isPeerPrimaryDisplayValid =
+                pi.primaryDisplay == kInvalidDisplayIndex ||
+                    pi.primaryDisplay >= pi.displays.length;
+            final newDisplay =
+                isPeerPrimaryDisplayValid ? 0 : pi.primaryDisplay;
+            bind.sessionSwitchDisplay(
+              isDesktop: isDesktop,
+              sessionId: sessionId,
+              value: Int32List.fromList([newDisplay]),
+            );
+
+            if (_pi.isSupportMultiUiSession) {
+              // If the peer supports multi-ui-session, no switch display message will be send back.
+              // We need to update the display manually.
+              switchToNewDisplay(newDisplay, sessionId, peerId);
+            }
+          } else {
+            msgBox(sessionId, 'nocancel-error', 'Prompt', 'No Displays', '',
+                parent.target!.dialogManager);
+          }
+        }
       }
     }
+    parent.target!.canvasModel
+        .tryUpdateScrollStyle(Duration(milliseconds: 300), null);
     notifyListeners();
+  }
+
+  handlePlatformAdditions(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
+    final updateData = evt['platform_additions'] as String?;
+    if (updateData == null) {
+      return;
+    }
+
+    if (updateData.isEmpty) {
+      _pi.platformAdditions.remove(kPlatformAdditionsRustDeskVirtualDisplays);
+      _pi.platformAdditions.remove(kPlatformAdditionsAmyuniVirtualDisplays);
+    } else {
+      try {
+        final updateJson = json.decode(updateData) as Map<String, dynamic>;
+        for (final key in updateJson.keys) {
+          _pi.platformAdditions[key] = updateJson[key];
+        }
+        if (!updateJson
+            .containsKey(kPlatformAdditionsRustDeskVirtualDisplays)) {
+          _pi.platformAdditions
+              .remove(kPlatformAdditionsRustDeskVirtualDisplays);
+        }
+        if (!updateJson.containsKey(kPlatformAdditionsAmyuniVirtualDisplays)) {
+          _pi.platformAdditions.remove(kPlatformAdditionsAmyuniVirtualDisplays);
+        }
+      } catch (e) {
+        debugPrint('Failed to decode platformAdditions $e');
+      }
+    }
+
+    cachedPeerData.peerInfo['platform_additions'] =
+        json.encode(_pi.platformAdditions);
+  }
+
+  handleFollowCurrentDisplay(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
+    if (evt['display_idx'] != null) {
+      if (pi.currentDisplay == kAllDisplayValue) {
+        return;
+      }
+      _pi.currentDisplay = int.parse(evt['display_idx']);
+      try {
+        CurrentDisplayState.find(peerId).value = _pi.currentDisplay;
+      } catch (e) {
+        //
+      }
+      bind.sessionSwitchDisplay(
+        isDesktop: isDesktop,
+        sessionId: sessionId,
+        value: Int32List.fromList([_pi.currentDisplay]),
+      );
+    }
+    notifyListeners();
+  }
+
+  // Directly switch to the new display without waiting for the response.
+  switchToNewDisplay(int display, SessionID sessionId, String peerId,
+      {bool updateCursorPos = false}) {
+    // no need to wait for the response
+    pi.currentDisplay = display;
+    updateCurDisplay(sessionId, updateCursorPos: updateCursorPos);
+    try {
+      CurrentDisplayState.find(peerId).value = display;
+    } catch (e) {
+      //
+    }
   }
 
   updateBlockInputState(Map<String, dynamic> evt, String peerId) {
@@ -528,18 +1167,29 @@ class FfiModel with ChangeNotifier {
     }
   }
 
-  updatePrivacyMode(Map<String, dynamic> evt, String peerId) {
+  updatePrivacyMode(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
     notifyListeners();
     try {
-      PrivacyModeState.find(peerId).value =
-          bind.sessionGetToggleOptionSync(id: peerId, arg: 'privacy-mode');
+      final isOn = bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: 'privacy-mode');
+      if (isOn) {
+        var privacyModeImpl = await bind.sessionGetOption(
+            sessionId: sessionId, arg: 'privacy-mode-impl-key');
+        // For compatibility, version < 1.2.4, the default value is 'privacy_mode_impl_mag'.
+        final initDefaultPrivacyMode = 'privacy_mode_impl_mag';
+        PrivacyModeState.find(peerId).value =
+            privacyModeImpl ?? initDefaultPrivacyMode;
+      } else {
+        PrivacyModeState.find(peerId).value = '';
+      }
     } catch (e) {
       //
     }
   }
 
   void setViewOnly(String id, bool value) {
-    if (version_cmp(_pi.version, '1.2.0') < 0) return;
+    if (versionCmp(_pi.version, '1.2.0') < 0) return;
     // tmp fix for https://github.com/rustdesk/rustdesk/pull/3706#issuecomment-1481242389
     // because below rx not used in mobile version, so not initialized, below code will cause crash
     // current our flutter code quality is fucking shit now. !!!!!!!!!!!!!!!!
@@ -547,8 +1197,8 @@ class FfiModel with ChangeNotifier {
       if (value) {
         ShowRemoteCursorState.find(id).value = value;
       } else {
-        ShowRemoteCursorState.find(id).value =
-            bind.sessionGetToggleOptionSync(id: id, arg: 'show-remote-cursor');
+        ShowRemoteCursorState.find(id).value = bind.sessionGetToggleOptionSync(
+            sessionId: sessionId, arg: 'show-remote-cursor');
       }
     } catch (e) {
       //
@@ -567,88 +1217,118 @@ class ImageModel with ChangeNotifier {
 
   String id = '';
 
+  late final SessionID sessionId;
+
+  bool _useTextureRender = false;
+
   WeakReference<FFI> parent;
 
   final List<Function(String)> callbacksOnFirstImage = [];
 
-  ImageModel(this.parent);
+  ImageModel(this.parent) {
+    sessionId = parent.target!.sessionId;
+  }
+
+  get useTextureRender => _useTextureRender;
 
   addCallbackOnFirstImage(Function(String) cb) => callbacksOnFirstImage.add(cb);
 
-  onRgba(Uint8List rgba) {
-    if (_waitForImage[id]!) {
-      _waitForImage[id] = false;
-      parent.target?.dialogManager.dismissAll();
-      if (isDesktop) {
-        for (final cb in callbacksOnFirstImage) {
-          cb(id);
-        }
-      }
-    }
+  clearImage() => _image = null;
 
-    final pid = parent.target?.id;
-    img.decodeImageFromPixels(
-        rgba,
-        parent.target?.ffiModel.display.width ?? 0,
-        parent.target?.ffiModel.display.height ?? 0,
-        isWeb ? ui.PixelFormat.rgba8888 : ui.PixelFormat.bgra8888,
-        onPixelsCopied: () {
-      // Unlock the rgba memory from rust codes.
-      platformFFI.nextRgba(id);
-    }).then((image) {
-      if (parent.target?.id != pid) return;
-      try {
-        // my throw exception, because the listener maybe already dispose
-        update(image);
-      } catch (e) {
-        debugPrint('update image: $e');
+  bool _webDecodingRgba = false;
+  final List<Uint8List> _webRgbaList = List.empty(growable: true);
+  webOnRgba(int display, Uint8List rgba) async {
+    // deep copy needed, otherwise "instantiateCodec failed: TypeError: Cannot perform Construct on a detached ArrayBuffer"
+    _webRgbaList.add(Uint8List.fromList(rgba));
+    if (_webDecodingRgba) {
+      return;
+    }
+    _webDecodingRgba = true;
+    try {
+      while (_webRgbaList.isNotEmpty) {
+        final rgba2 = _webRgbaList.last;
+        _webRgbaList.clear();
+        await decodeAndUpdate(display, rgba2);
       }
-    });
+    } catch (e) {
+      debugPrint('onRgba error: $e');
+    }
+    _webDecodingRgba = false;
+  }
+
+  onRgba(int display, Uint8List rgba) async {
+    try {
+      await decodeAndUpdate(display, rgba);
+    } catch (e) {
+      debugPrint('onRgba error: $e');
+    }
+    platformFFI.nextRgba(sessionId, display);
+  }
+
+  decodeAndUpdate(int display, Uint8List rgba) async {
+    final pid = parent.target?.id;
+    final rect = parent.target?.ffiModel.pi.getDisplayRect(display);
+    final image = await img.decodeImageFromPixels(
+      rgba,
+      rect?.width.toInt() ?? 0,
+      rect?.height.toInt() ?? 0,
+      isWeb | isWindows | isLinux
+          ? ui.PixelFormat.rgba8888
+          : ui.PixelFormat.bgra8888,
+    );
+    if (parent.target?.id != pid) return;
+    await update(image);
   }
 
   update(ui.Image? image) async {
     if (_image == null && image != null) {
-      if (isWebDesktop || isDesktop) {
+      if (isDesktop || isWebDesktop) {
         await parent.target?.canvasModel.updateViewStyle();
         await parent.target?.canvasModel.updateScrollStyle();
-      } else {
-        final size = MediaQueryData.fromWindow(ui.window).size;
-        final canvasWidth = size.width;
-        final canvasHeight = size.height;
-        final xscale = canvasWidth / image.width;
-        final yscale = canvasHeight / image.height;
-        parent.target?.canvasModel.scale = min(xscale, yscale);
       }
       if (parent.target != null) {
         await initializeCursorAndCanvas(parent.target!);
       }
-      if (parent.target?.ffiModel.isPeerAndroid ?? false) {
-        bind.sessionSetViewStyle(id: id, value: 'adaptive');
-        parent.target?.canvasModel.updateViewStyle();
-      }
     }
+    _image?.dispose();
     _image = image;
     if (image != null) notifyListeners();
   }
 
   // mobile only
-  // for desktop, height should minus tabbar height
   double get maxScale {
     if (_image == null) return 1.5;
-    final size = MediaQueryData.fromWindow(ui.window).size;
+    final size = parent.target!.canvasModel.getSize();
     final xscale = size.width / _image!.width;
     final yscale = size.height / _image!.height;
     return max(1.5, max(xscale, yscale));
   }
 
   // mobile only
-  // for desktop, height should minus tabbar height
   double get minScale {
     if (_image == null) return 1.5;
-    final size = MediaQueryData.fromWindow(ui.window).size;
+    final size = parent.target!.canvasModel.getSize();
     final xscale = size.width / _image!.width;
     final yscale = size.height / _image!.height;
     return min(xscale, yscale) / 1.5;
+  }
+
+  updateUserTextureRender() {
+    final preValue = _useTextureRender;
+    _useTextureRender = isDesktop && bind.mainGetUseTextureRender();
+    if (preValue != _useTextureRender) {
+      notifyListeners();
+    }
+  }
+
+  setUseTextureRender(bool value) {
+    _useTextureRender = value;
+    notifyListeners();
+  }
+
+  void disposeImage() {
+    _image?.dispose();
+    _image = null;
   }
 }
 
@@ -742,6 +1422,7 @@ class CanvasModel with ChangeNotifier {
   // double windowBorderWidth = 0.0;
   // remote id
   String id = '';
+  late final SessionID sessionId;
   // scroll offset x percent
   double _scrollX = 0.0;
   // scroll offset y percent
@@ -749,11 +1430,22 @@ class CanvasModel with ChangeNotifier {
   ScrollStyle _scrollStyle = ScrollStyle.scrollauto;
   ViewStyle _lastViewStyle = ViewStyle.defaultViewStyle();
 
+  Timer? _timerMobileFocusCanvasCursor;
+
+  // `isMobileCanvasChanged` is used to avoid canvas reset when changing the input method
+  // after showing the soft keyboard.
+  bool isMobileCanvasChanged = false;
+
+  final ScrollController _horizontal = ScrollController();
+  final ScrollController _vertical = ScrollController();
+
   final _imageOverflow = false.obs;
 
   WeakReference<FFI> parent;
 
-  CanvasModel(this.parent);
+  CanvasModel(this.parent) {
+    sessionId = parent.target!.sessionId;
+  }
 
   double get x => _x;
   double get y => _y;
@@ -771,37 +1463,52 @@ class CanvasModel with ChangeNotifier {
     _scrollY = y;
   }
 
+  ScrollController get scrollHorizontal => _horizontal;
+  ScrollController get scrollVertical => _vertical;
   double get scrollX => _scrollX;
   double get scrollY => _scrollY;
 
-  static double get leftToEdge => (isDesktop || isWebDesktop)
-      ? windowBorderWidth + kDragToResizeAreaPadding.left
-      : 0;
-  static double get rightToEdge => (isDesktop || isWebDesktop)
-      ? windowBorderWidth + kDragToResizeAreaPadding.right
-      : 0;
-  static double get topToEdge => (isDesktop || isWebDesktop)
+  static double get leftToEdge =>
+      isDesktop ? windowBorderWidth + kDragToResizeAreaPadding.left : 0;
+  static double get rightToEdge =>
+      isDesktop ? windowBorderWidth + kDragToResizeAreaPadding.right : 0;
+  static double get topToEdge => isDesktop
       ? tabBarHeight + windowBorderWidth + kDragToResizeAreaPadding.top
       : 0;
-  static double get bottomToEdge => (isDesktop || isWebDesktop)
-      ? windowBorderWidth + kDragToResizeAreaPadding.bottom
-      : 0;
+  static double get bottomToEdge =>
+      isDesktop ? windowBorderWidth + kDragToResizeAreaPadding.bottom : 0;
 
-  updateViewStyle() async {
-    Size getSize() {
-      final size = MediaQueryData.fromWindow(ui.window).size;
-      // If minimized, w or h may be negative here.
-      double w = size.width - leftToEdge - rightToEdge;
-      double h = size.height - topToEdge - bottomToEdge;
-      return Size(w < 0 ? 0 : w, h < 0 ? 0 : h);
+  Size getSize() {
+    final mediaData = MediaQueryData.fromView(ui.window);
+    final size = mediaData.size;
+    // If minimized, w or h may be negative here.
+    double w = size.width - leftToEdge - rightToEdge;
+    double h = size.height - topToEdge - bottomToEdge;
+    if (isMobile) {
+      h = h -
+          mediaData.viewInsets.bottom -
+          (parent.target?.cursorModel.keyHelpToolsRectToAdjustCanvas?.bottom ??
+              0);
     }
+    return Size(w < 0 ? 0 : w, h < 0 ? 0 : h);
+  }
 
-    final style = await bind.sessionGetViewStyle(id: id);
+  // mobile only
+  double getAdjustY() {
+    final bottom =
+        parent.target?.cursorModel.keyHelpToolsRectToAdjustCanvas?.bottom ?? 0;
+    return max(bottom - MediaQueryData.fromView(ui.window).padding.top, 0);
+  }
+
+  updateSize() => _size = getSize();
+
+  updateViewStyle({refreshMousePos = true, notify = true}) async {
+    final style = await bind.sessionGetViewStyle(sessionId: sessionId);
     if (style == null) {
       return;
     }
 
-    _size = getSize();
+    updateSize();
     final displayWidth = getDisplayWidth();
     final displayHeight = getDisplayHeight();
     final viewStyle = ViewStyle(
@@ -824,15 +1531,40 @@ class CanvasModel with ChangeNotifier {
     if (kIgnoreDpi && style == kRemoteViewStyleOriginal) {
       _scale = 1.0 / _devicePixelRatio;
     }
+    _resetCanvasOffset(displayWidth, displayHeight);
+    _imageOverflow.value = _x < 0 || y < 0;
+    if (notify) {
+      notifyListeners();
+    }
+    if (!isMobile && refreshMousePos) {
+      parent.target?.inputModel.refreshMousePos();
+    }
+    tryUpdateScrollStyle(Duration.zero, style);
+  }
+
+  _resetCanvasOffset(int displayWidth, int displayHeight) {
     _x = (size.width - displayWidth * _scale) / 2;
     _y = (size.height - displayHeight * _scale) / 2;
-    _imageOverflow.value = _x < 0 || y < 0;
-    notifyListeners();
-    parent.target?.inputModel.refreshMousePos();
+    if (isMobile) {
+      _moveToCenterCursor();
+    }
+  }
+
+  tryUpdateScrollStyle(Duration duration, String? style) async {
+    if (_scrollStyle != ScrollStyle.scrollbar) return;
+    style ??= await bind.sessionGetViewStyle(sessionId: sessionId);
+    if (style != kRemoteViewStyleOriginal) {
+      return;
+    }
+
+    _resetScroll();
+    Future.delayed(duration, () async {
+      updateScrollPercent();
+    });
   }
 
   updateScrollStyle() async {
-    final style = await bind.sessionGetScrollStyle(id: id);
+    final style = await bind.sessionGetScrollStyle(sessionId: sessionId);
     if (style == kRemoteScrollStyleBar) {
       _scrollStyle = ScrollStyle.scrollbar;
       _resetScroll();
@@ -850,20 +1582,20 @@ class CanvasModel with ChangeNotifier {
   }
 
   bool get cursorEmbedded =>
-      parent.target?.ffiModel.display.cursorEmbedded ?? false;
+      parent.target?.ffiModel._pi.cursorEmbedded ?? false;
 
   int getDisplayWidth() {
     final defaultWidth = (isDesktop || isWebDesktop)
         ? kDesktopDefaultDisplayWidth
         : kMobileDefaultDisplayWidth;
-    return parent.target?.ffiModel.display.width ?? defaultWidth;
+    return parent.target?.ffiModel.rect?.width.toInt() ?? defaultWidth;
   }
 
   int getDisplayHeight() {
     final defaultHeight = (isDesktop || isWebDesktop)
         ? kDesktopDefaultDisplayHeight
         : kMobileDefaultDisplayHeight;
-    return parent.target?.ffiModel.display.height ?? defaultHeight;
+    return parent.target?.ffiModel.rect?.height.toInt() ?? defaultHeight;
   }
 
   static double get windowBorderWidth => stateGlobal.windowBorderWidth.value;
@@ -900,9 +1632,9 @@ class CanvasModel with ChangeNotifier {
     }
 
     // If keyboard is not permitted, do not move cursor when mouse is moving.
-    if (parent.target != null && parent.target!.ffiModel.keyboard()) {
+    if (parent.target != null && parent.target!.ffiModel.keyboard) {
       // Draw cursor if is not desktop.
-      if (!isDesktop) {
+      if (!(isDesktop || isWebDesktop)) {
         parent.target!.cursorModel.moveLocal(x, y);
       } else {
         try {
@@ -921,6 +1653,9 @@ class CanvasModel with ChangeNotifier {
 
   panX(double dx) {
     _x += dx;
+    if (isMobile) {
+      isMobileCanvasChanged = true;
+    }
     notifyListeners();
   }
 
@@ -928,48 +1663,119 @@ class CanvasModel with ChangeNotifier {
     if (isWebDesktop) {
       updateViewStyle();
     } else {
-      _x = (size.width - getDisplayWidth() * _scale) / 2;
-      _y = (size.height - getDisplayHeight() * _scale) / 2;
+      _resetCanvasOffset(getDisplayWidth(), getDisplayHeight());
     }
     notifyListeners();
   }
 
   panY(double dy) {
     _y += dy;
+    if (isMobile) {
+      isMobileCanvasChanged = true;
+    }
     notifyListeners();
   }
 
-  updateScale(double v) {
+  // mobile only
+  updateScale(double v, Offset focalPoint) {
     if (parent.target?.imageModel.image == null) return;
-    final offset = parent.target?.cursorModel.offset ?? const Offset(0, 0);
-    var r = parent.target?.cursorModel.getVisibleRect() ?? Rect.zero;
-    final px0 = (offset.dx - r.left) * _scale;
-    final py0 = (offset.dy - r.top) * _scale;
+    final s = _scale;
     _scale *= v;
     final maxs = parent.target?.imageModel.maxScale ?? 1;
     final mins = parent.target?.imageModel.minScale ?? 1;
     if (_scale > maxs) _scale = maxs;
     if (_scale < mins) _scale = mins;
-    r = parent.target?.cursorModel.getVisibleRect() ?? Rect.zero;
-    final px1 = (offset.dx - r.left) * _scale;
-    final py1 = (offset.dy - r.top) * _scale;
-    _x -= px1 - px0;
-    _y -= py1 - py0;
+    // (focalPoint.dx - _x_1) / s1 + displayOriginX = (focalPoint.dx - _x_2) / s2 + displayOriginX
+    // _x_2 = focalPoint.dx - (focalPoint.dx - _x_1) / s1 * s2
+    _x = focalPoint.dx - (focalPoint.dx - _x) / s * _scale;
+    final adjust = getAdjustY();
+    // (focalPoint.dy - _y_1 - adjust) / s1 + displayOriginY = (focalPoint.dy - _y_2 - adjust) / s2 + displayOriginY
+    // _y_2 = focalPoint.dy - adjust - (focalPoint.dy - _y_1 - adjust) / s1 * s2
+    _y = focalPoint.dy - adjust - (focalPoint.dy - _y - adjust) / s * _scale;
+    if (isMobile) {
+      isMobileCanvasChanged = true;
+    }
     notifyListeners();
   }
 
-  clear([bool notify = false]) {
+  // For reset canvas to the last view style
+  reset() {
+    _scale = _lastViewStyle.scale;
+    _devicePixelRatio = ui.window.devicePixelRatio;
+    if (kIgnoreDpi && _lastViewStyle.style == kRemoteViewStyleOriginal) {
+      _scale = 1.0 / _devicePixelRatio;
+    }
+    _resetCanvasOffset(getDisplayWidth(), getDisplayHeight());
+    bind.sessionSetViewStyle(sessionId: sessionId, value: _lastViewStyle.style);
+    notifyListeners();
+  }
+
+  clear() {
     _x = 0;
     _y = 0;
     _scale = 1.0;
-    if (notify) notifyListeners();
+    _lastViewStyle = ViewStyle.defaultViewStyle();
+    _timerMobileFocusCanvasCursor?.cancel();
+  }
+
+  updateScrollPercent() {
+    final percentX = _horizontal.hasClients
+        ? _horizontal.position.extentBefore /
+            (_horizontal.position.extentBefore +
+                _horizontal.position.extentInside +
+                _horizontal.position.extentAfter)
+        : 0.0;
+    final percentY = _vertical.hasClients
+        ? _vertical.position.extentBefore /
+            (_vertical.position.extentBefore +
+                _vertical.position.extentInside +
+                _vertical.position.extentAfter)
+        : 0.0;
+    setScrollPercent(percentX, percentY);
+  }
+
+  void mobileFocusCanvasCursor() {
+    _timerMobileFocusCanvasCursor?.cancel();
+    _timerMobileFocusCanvasCursor =
+        Timer(Duration(milliseconds: 100), () async {
+      updateSize();
+      _resetCanvasOffset(getDisplayWidth(), getDisplayHeight());
+      notifyListeners();
+    });
+  }
+
+  // mobile only
+  // Move the canvas to make the cursor visible(center) on the screen.
+  void _moveToCenterCursor() {
+    Rect? imageRect = parent.target?.ffiModel.rect;
+    if (imageRect == null) {
+      // unreachable
+      return;
+    }
+    final maxX = 0.0;
+    final minX = _size.width + (imageRect.left - imageRect.right) * _scale;
+    final maxY = 0.0;
+    final minY = _size.height + (imageRect.top - imageRect.bottom) * _scale;
+    Offset offsetToCenter =
+        parent.target?.cursorModel.getCanvasOffsetToCenterCursor() ??
+            Offset.zero;
+    if (minX < 0) {
+      _x = min(max(offsetToCenter.dx, minX), maxX);
+    } else {
+      // _size.width > (imageRect.right, imageRect.left) * _scale, we should not change _x
+    }
+    if (minY < 0) {
+      _y = min(max(offsetToCenter.dy, minY), maxY);
+    } else {
+      // _size.height > (imageRect.bottom - imageRect.top) * _scale, , we should not change _y
+    }
   }
 }
 
 // data for cursor
 class CursorData {
   final String peerId;
-  final int id;
+  final String id;
   final img2.Image image;
   double scale;
   Uint8List? data;
@@ -1009,7 +1815,7 @@ class CursorData {
     }
 
     if (_doubleToInt(oldScale) != _doubleToInt(scale)) {
-      if (Platform.isWindows) {
+      if (isWindows) {
         data = img2
             .copyResize(
               image,
@@ -1017,7 +1823,7 @@ class CursorData {
               height: (height * scale).toInt(),
               interpolation: img2.Interpolation.average,
             )
-            .getBytes(format: img2.Format.bgra);
+            .getBytes(order: img2.ChannelOrder.bgra);
       } else {
         data = Uint8List.fromList(
           img2.encodePng(
@@ -1049,13 +1855,15 @@ const _forbiddenCursorPng =
 const _defaultCursorPng =
     'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARzQklUCAgICHwIZIgAAAFmSURBVFiF7dWxSlxREMbx34QFDRowYBchZSxSCWlMCOwD5FGEFHap06UI7KPsAyyEEIQFqxRaCqYTsqCJFsKkuAeRXb17wrqV918dztw55zszc2fo6Oh47MR/e3zO1/iAHWmznHKGQwx9ip/LEbCfazbsoY8j/JLOhcC6sCW9wsjEwJf483AC9nPNc1+lFRwI13d+l3rYFS799rFGxJMqARv2pBXh+72XQ7gWvklPS7TmMl9Ak/M+DqrENvxAv/guKKApuKPWl0/TROK4+LbSqzhuB+OZ3fRSeFPWY+Fkyn56Y29hfgTSpnQ+s98cvorVey66uPlNFxKwZOYLCGfCs5n9NMYVrsp6mvXSoFqpqYFDvMBkStgJJe93dZOwVXxbqUnBENulydSReqUrDhcX0PT2EXarBYS3GNXMhboinBgIl9K71kg0L3+PvyYGdVpruT2MwrF0iotiXfIwus0Dj+OOjo6Of+e7ab74RkpgAAAAAElFTkSuQmCC';
 
+const kPreForbiddenCursorId = "-2";
 final preForbiddenCursor = PredefinedCursor(
   png: _forbiddenCursorPng,
-  id: -2,
+  id: kPreForbiddenCursorId,
 );
+const kPreDefaultCursorId = "-1";
 final preDefaultCursor = PredefinedCursor(
   png: _defaultCursorPng,
-  id: -1,
+  id: kPreDefaultCursorId,
   hotxGetter: (double w) => w / 2,
   hotyGetter: (double h) => h / 2,
 );
@@ -1065,7 +1873,7 @@ class PredefinedCursor {
   img2.Image? _image2;
   CursorData? _cache;
   String png;
-  int id;
+  String id;
   double Function(double)? hotxGetter;
   double Function(double)? hotyGetter;
 
@@ -1080,16 +1888,25 @@ class PredefinedCursor {
   init() {
     _image2 = img2.decodePng(base64Decode(png));
     if (_image2 != null) {
+      // The png type of forbidden cursor image is `PngColorType.indexed`.
+      if (id == kPreForbiddenCursorId) {
+        _image2 = _image2!.convert(format: img2.Format.uint8, numChannels: 4);
+      }
+
       () async {
         final defaultImg = _image2!;
         // This function is called only one time, no need to care about the performance.
-        Uint8List data = defaultImg.getBytes(format: img2.Format.rgba);
+        Uint8List data = defaultImg.getBytes(order: img2.ChannelOrder.rgba);
+        _image?.dispose();
         _image = await img.decodeImageFromPixels(
             data, defaultImg.width, defaultImg.height, ui.PixelFormat.rgba8888);
-
+        if (_image == null) {
+          print("decodeImageFromPixels failed, pre-defined cursor $id");
+          return;
+        }
         double scale = 1.0;
-        if (Platform.isWindows) {
-          data = _image2!.getBytes(format: img2.Format.bgra);
+        if (isWindows) {
+          data = _image2!.getBytes(order: img2.ChannelOrder.bgra);
         } else {
           data = Uint8List.fromList(img2.encodePng(_image2!));
         }
@@ -1114,22 +1931,62 @@ class PredefinedCursor {
 
 class CursorModel with ChangeNotifier {
   ui.Image? _image;
-  final _images = <int, Tuple3<ui.Image, double, double>>{};
+  final _images = <String, Tuple3<ui.Image, double, double>>{};
   CursorData? _cache;
-  final _cacheMap = <int, CursorData>{};
+  final _cacheMap = <String, CursorData>{};
   final _cacheKeys = <String>{};
   double _x = -10000;
   double _y = -10000;
+  // int.parse(evt['id']) may cause FormatException
+  // So we use String here.
+  String _id = "-1";
   double _hotx = 0;
   double _hoty = 0;
   double _displayOriginX = 0;
   double _displayOriginY = 0;
   DateTime? _firstUpdateMouseTime;
+  Rect? _windowRect;
+  List<RemoteWindowCoords> _remoteWindowCoords = [];
   bool gotMouseControl = true;
   DateTime _lastPeerMouse = DateTime.now()
       .subtract(Duration(milliseconds: 3000 * kMouseControlTimeoutMSec));
-  String id = '';
+  String peerId = '';
   WeakReference<FFI> parent;
+
+  // Only for mobile, touch mode
+  // To block touch event above the KeyHelpTools
+  //
+  // A better way is to not listen events from the KeyHelpTools.
+  // But we're now using a Container(child: Stack(...)) to wrap the KeyHelpTools,
+  // and the listener is on the Container.
+  Rect? _keyHelpToolsRect;
+  // `lastIsBlocked` is only used in common/widgets/remote_input.dart -> _RawTouchGestureDetectorRegionState -> onDoubleTap()
+  // Because onDoubleTap() doesn't have the `event` parameter, we can't get the touch event's position.
+  bool _lastIsBlocked = false;
+  bool _lastKeyboardIsVisible = false;
+
+  bool get lastKeyboardIsVisible => _lastKeyboardIsVisible;
+
+  Rect? get keyHelpToolsRectToAdjustCanvas =>
+      _lastKeyboardIsVisible ? _keyHelpToolsRect : null;
+  keyHelpToolsVisibilityChanged(Rect? r, bool keyboardIsVisible) {
+    _keyHelpToolsRect = r;
+    if (r == null) {
+      _lastIsBlocked = false;
+    } else {
+      // Block the touch event is safe here.
+      // `lastIsBlocked` is only used in onDoubleTap() to block the touch event from the KeyHelpTools.
+      // `lastIsBlocked` will be set when the cursor is moving or touch somewhere else.
+      _lastIsBlocked = true;
+    }
+    if (isMobile && _lastKeyboardIsVisible != keyboardIsVisible) {
+      parent.target?.canvasModel.mobileFocusCanvasCursor();
+      parent.target?.canvasModel.isMobileCanvasChanged = false;
+    }
+    _lastKeyboardIsVisible = keyboardIsVisible;
+  }
+
+  get lastIsBlocked => _lastIsBlocked;
 
   ui.Image? get image => _image;
   CursorData? get cache => _cache;
@@ -1137,10 +1994,14 @@ class CursorModel with ChangeNotifier {
   double get x => _x - _displayOriginX;
   double get y => _y - _displayOriginY;
 
+  double get devicePixelRatio => parent.target!.canvasModel.devicePixelRatio;
+
   Offset get offset => Offset(_x, _y);
 
   double get hotx => _hotx;
   double get hoty => _hoty;
+
+  set id(String id) => _id = id;
 
   bool get isPeerControlProtected =>
       DateTime.now().difference(_lastPeerMouse).inMilliseconds <
@@ -1161,8 +2022,10 @@ class CursorModel with ChangeNotifier {
   addKey(String key) => _cacheKeys.add(key);
 
   // remote physical display coordinate
+  // For update pan (mobile), onOneFingerPanStart, onOneFingerPanUpdate, onHoldDragUpdate
   Rect getVisibleRect() {
-    final size = MediaQueryData.fromWindow(ui.window).size;
+    final size = parent.target?.canvasModel.getSize() ??
+        MediaQueryData.fromView(ui.window).size;
     final xoffset = parent.target?.canvasModel.x ?? 0;
     final yoffset = parent.target?.canvasModel.y ?? 0;
     final scale = parent.target?.canvasModel.scale ?? 1;
@@ -1171,28 +2034,93 @@ class CursorModel with ChangeNotifier {
     return Rect.fromLTWH(x0, y0, size.width / scale, size.height / scale);
   }
 
-  double adjustForKeyboard() {
-    final m = MediaQueryData.fromWindow(ui.window);
-    var keyboardHeight = m.viewInsets.bottom;
-    final size = m.size;
-    if (keyboardHeight < 100) return 0;
-    final s = parent.target?.canvasModel.scale ?? 1.0;
-    final thresh = (size.height - keyboardHeight) / 2;
-    var h = (_y - getVisibleRect().top) * s; // local physical display height
-    return h - thresh;
+  Offset getCanvasOffsetToCenterCursor() {
+    // Cursor should be at the center of the visible rect.
+    // _x = rect.left + rect.width / 2
+    // _y = rect.right + rect.height / 2
+    // See `getVisibleRect()`
+    // _x = _displayOriginX - xoffset / scale + size.width / scale * 0.5;
+    // _y = _displayOriginY - yoffset / scale + size.height / scale * 0.5;
+    final size = parent.target?.canvasModel.getSize() ??
+        MediaQueryData.fromView(ui.window).size;
+    final xoffset = (_displayOriginX - _x) * scale + size.width * 0.5;
+    final yoffset = (_displayOriginY - _y) * scale + size.height * 0.5;
+    return Offset(xoffset, yoffset);
   }
 
-  move(double x, double y) {
-    moveLocal(x, y);
-    parent.target?.inputModel.moveMouse(_x, _y);
+  get scale => parent.target?.canvasModel.scale ?? 1.0;
+
+  // mobile Soft keyboard, block touch event from the KeyHelpTools
+  shouldBlock(double x, double y) {
+    if (!(parent.target?.ffiModel.touchMode ?? false)) {
+      return false;
+    }
+    if (_keyHelpToolsRect == null) {
+      return false;
+    }
+    if (isPointInRect(Offset(x, y), _keyHelpToolsRect!)) {
+      return true;
+    }
+    return false;
   }
 
-  moveLocal(double x, double y) {
-    final scale = parent.target?.canvasModel.scale ?? 1.0;
+  // For touch mode
+  Future<bool> move(double x, double y) async {
+    if (shouldBlock(x, y)) {
+      _lastIsBlocked = true;
+      return false;
+    }
+    _lastIsBlocked = false;
+    if (!_moveLocalIfInRemoteRect(x, y)) {
+      return false;
+    }
+    await parent.target?.inputModel.moveMouse(_x, _y);
+    return true;
+  }
+
+  bool isInRemoteRect(Offset offset) {
+    return getRemotePosInRect(offset) != null;
+  }
+
+  Offset? getRemotePosInRect(Offset offset) {
+    final adjust = parent.target?.canvasModel.getAdjustY() ?? 0;
+    final newPos = _getNewPos(offset.dx, offset.dy, adjust);
+    final visibleRect = getVisibleRect();
+    if (!isPointInRect(newPos, visibleRect)) {
+      return null;
+    }
+    final rect = parent.target?.ffiModel.rect;
+    if (rect != null) {
+      if (!isPointInRect(newPos, rect)) {
+        return null;
+      }
+    }
+    return newPos;
+  }
+
+  Offset _getNewPos(double x, double y, double adjust) {
     final xoffset = parent.target?.canvasModel.x ?? 0;
     final yoffset = parent.target?.canvasModel.y ?? 0;
-    _x = (x - xoffset) / scale + _displayOriginX;
-    _y = (y - yoffset) / scale + _displayOriginY;
+    final newX = (x - xoffset) / scale + _displayOriginX;
+    final newY = (y - yoffset - adjust) / scale + _displayOriginY;
+    return Offset(newX, newY);
+  }
+
+  bool _moveLocalIfInRemoteRect(double x, double y) {
+    final newPos = getRemotePosInRect(Offset(x, y));
+    if (newPos == null) {
+      return false;
+    }
+    _x = newPos.dx;
+    _y = newPos.dy;
+    notifyListeners();
+    return true;
+  }
+
+  moveLocal(double x, double y, {double adjust = 0}) {
+    final newPos = _getNewPos(x, y, adjust);
+    _x = newPos.dx;
+    _y = newPos.dy;
     notifyListeners();
   }
 
@@ -1200,20 +2128,18 @@ class CursorModel with ChangeNotifier {
     _x = _displayOriginX;
     _y = _displayOriginY;
     parent.target?.inputModel.moveMouse(_x, _y);
-    parent.target?.canvasModel.clear(true);
+    parent.target?.canvasModel.reset();
     notifyListeners();
   }
 
-  updatePan(double dx, double dy, bool touchMode) {
-    if (parent.target?.imageModel.image == null) return;
+  updatePan(Offset delta, Offset localPosition, bool touchMode) async {
     if (touchMode) {
-      final scale = parent.target?.canvasModel.scale ?? 1.0;
-      _x += dx / scale;
-      _y += dy / scale;
-      parent.target?.inputModel.moveMouse(_x, _y);
-      notifyListeners();
+      await _handleTouchMode(delta, localPosition);
       return;
     }
+    double dx = delta.dx;
+    double dy = delta.dy;
+    if (parent.target?.imageModel.image == null) return;
     final scale = parent.target?.canvasModel.scale ?? 1.0;
     dx /= scale;
     dy /= scale;
@@ -1266,51 +2192,152 @@ class CursorModel with ChangeNotifier {
     }
 
     if (dx == 0 && dy == 0) return;
-    _x += dx;
-    _y += dy;
+
+    Point<double>? newPos;
+    final rect = parent.target?.ffiModel.rect;
+    if (rect == null) {
+      // unreachable
+      return;
+    }
+    newPos = InputModel.getPointInRemoteRect(
+        false,
+        parent.target?.ffiModel.pi.platform,
+        kPointerEventKindMouse,
+        kMouseEventTypeDefault,
+        _x + dx,
+        _y + dy,
+        rect,
+        buttons: kPrimaryButton);
+    if (newPos == null) {
+      return;
+    }
+    dx = newPos.x - _x;
+    dy = newPos.y - _y;
+    _x = newPos.x;
+    _y = newPos.y;
     if (tryMoveCanvasX && dx != 0) {
-      parent.target?.canvasModel.panX(-dx);
+      parent.target?.canvasModel.panX(-dx * scale);
     }
     if (tryMoveCanvasY && dy != 0) {
-      parent.target?.canvasModel.panY(-dy);
+      parent.target?.canvasModel.panY(-dy * scale);
     }
 
     parent.target?.inputModel.moveMouse(_x, _y);
     notifyListeners();
   }
 
+  bool _isInCurrentWindow(double x, double y) {
+    final w = _windowRect!.width / devicePixelRatio;
+    final h = _windowRect!.width / devicePixelRatio;
+    return x >= 0 && y >= 0 && x <= w && y <= h;
+  }
+
+  _handleTouchMode(Offset delta, Offset localPosition) async {
+    bool isMoved = false;
+    if (_remoteWindowCoords.isNotEmpty &&
+        _windowRect != null &&
+        !_isInCurrentWindow(localPosition.dx, localPosition.dy)) {
+      final coords = InputModel.findRemoteCoords(localPosition.dx,
+          localPosition.dy, _remoteWindowCoords, devicePixelRatio);
+      if (coords != null) {
+        double x2 =
+            (localPosition.dx - coords.relativeOffset.dx / devicePixelRatio) /
+                coords.canvas.scale;
+        double y2 =
+            (localPosition.dy - coords.relativeOffset.dy / devicePixelRatio) /
+                coords.canvas.scale;
+        x2 += coords.cursor.offset.dx;
+        y2 += coords.cursor.offset.dy;
+        await parent.target?.inputModel.moveMouse(x2, y2);
+        isMoved = true;
+      }
+    }
+    if (!isMoved) {
+      final rect = parent.target?.ffiModel.rect;
+      if (rect == null) {
+        // unreachable
+        return;
+      }
+
+      Offset? movementInRect(double x, double y, Rect r) {
+        final isXInRect = x >= r.left && x <= r.right;
+        final isYInRect = y >= r.top && y <= r.bottom;
+        if (!(isXInRect || isYInRect)) {
+          return null;
+        }
+        if (x < r.left) {
+          x = r.left;
+        } else if (x > r.right) {
+          x = r.right;
+        }
+        if (y < r.top) {
+          y = r.top;
+        } else if (y > r.bottom) {
+          y = r.bottom;
+        }
+        return Offset(x, y);
+      }
+
+      final scale = parent.target?.canvasModel.scale ?? 1.0;
+      var movement =
+          movementInRect(_x + delta.dx / scale, _y + delta.dy / scale, rect);
+      if (movement == null) {
+        return;
+      }
+      movement = movementInRect(movement.dx, movement.dy, getVisibleRect());
+      if (movement == null) {
+        return;
+      }
+
+      _x = movement.dx;
+      _y = movement.dy;
+      await parent.target?.inputModel.moveMouse(_x, _y);
+    }
+    notifyListeners();
+  }
+
+  disposeImages() {
+    _images.forEach((_, v) => v.item1.dispose());
+    _images.clear();
+  }
+
   updateCursorData(Map<String, dynamic> evt) async {
-    var id = int.parse(evt['id']);
-    _hotx = double.parse(evt['hotx']);
-    _hoty = double.parse(evt['hoty']);
-    var width = int.parse(evt['width']);
-    var height = int.parse(evt['height']);
+    final id = evt['id'];
+    final hotx = double.parse(evt['hotx']);
+    final hoty = double.parse(evt['hoty']);
+    final width = int.parse(evt['width']);
+    final height = int.parse(evt['height']);
     List<dynamic> colors = json.decode(evt['colors']);
     final rgba = Uint8List.fromList(colors.map((s) => s as int).toList());
     final image = await img.decodeImageFromPixels(
         rgba, width, height, ui.PixelFormat.rgba8888);
-    _image = image;
-    if (await _updateCache(rgba, image, id, width, height)) {
-      _images[id] = Tuple3(image, _hotx, _hoty);
-    } else {
-      _hotx = 0;
-      _hoty = 0;
+    if (image == null) {
+      return;
     }
-    try {
-      // my throw exception, because the listener maybe already dispose
-      notifyListeners();
-    } catch (e) {
-      debugPrint('WARNING: updateCursorId $id, without notifyListeners(). $e');
+    if (await _updateCache(rgba, image, id, hotx, hoty, width, height)) {
+      _images[id]?.item1.dispose();
+      _images[id] = Tuple3(image, hotx, hoty);
     }
+
+    // Update last cursor data.
+    // Do not use the previous `image` and `id`, because `_id` may be changed.
+    _updateCurData();
   }
 
   Future<bool> _updateCache(
-      Uint8List rgba, ui.Image image, int id, int w, int h) async {
+    Uint8List rgba,
+    ui.Image image,
+    String id,
+    double hotx,
+    double hoty,
+    int w,
+    int h,
+  ) async {
     Uint8List? data;
-    img2.Image imgOrigin =
-        img2.Image.fromBytes(w, h, rgba, format: img2.Format.rgba);
-    if (Platform.isWindows) {
-      data = imgOrigin.getBytes(format: img2.Format.bgra);
+    img2.Image imgOrigin = img2.Image.fromBytes(
+        width: w, height: h, bytes: rgba.buffer, order: img2.ChannelOrder.rgba);
+    if (isWindows) {
+      data = imgOrigin.getBytes(order: img2.ChannelOrder.bgra);
     } else {
       ByteData? imgBytes =
           await image.toByteData(format: ui.ImageByteFormat.png);
@@ -1319,33 +2346,45 @@ class CursorModel with ChangeNotifier {
       }
       data = imgBytes.buffer.asUint8List();
     }
-    _cache = CursorData(
-      peerId: this.id,
+    final cache = CursorData(
+      peerId: peerId,
       id: id,
       image: imgOrigin,
       scale: 1.0,
       data: data,
-      hotxOrigin: _hotx,
-      hotyOrigin: _hoty,
+      hotxOrigin: hotx,
+      hotyOrigin: hoty,
       width: w,
       height: h,
     );
-    _cacheMap[id] = _cache!;
+    _cacheMap[id] = cache;
     return true;
   }
 
-  updateCursorId(Map<String, dynamic> evt) async {
-    final id = int.parse(evt['id']);
-    _cache = _cacheMap[id];
-    final tmp = _images[id];
+  bool _updateCurData() {
+    _cache = _cacheMap[_id];
+    final tmp = _images[_id];
     if (tmp != null) {
       _image = tmp.item1;
       _hotx = tmp.item2;
       _hoty = tmp.item3;
-      notifyListeners();
+      try {
+        // may throw exception, because the listener maybe already dispose
+        notifyListeners();
+      } catch (e) {
+        debugPrint(
+            'WARNING: updateCursorId $_id, without notifyListeners(). $e');
+      }
+      return true;
     } else {
+      return false;
+    }
+  }
+
+  updateCursorId(Map<String, dynamic> evt) {
+    if (!_updateCurData()) {
       debugPrint(
-          'WARNING: updateCursorId $id, cache is ${_cache == null ? "null" : "not null"}. without notifyListeners()');
+          'WARNING: updateCursorId $_id, cache is ${_cache == null ? "null" : "not null"}. without notifyListeners()');
     }
   }
 
@@ -1365,12 +2404,14 @@ class CursorModel with ChangeNotifier {
     notifyListeners();
   }
 
-  updateDisplayOrigin(double x, double y) {
+  updateDisplayOrigin(double x, double y, {updateCursorPos = true}) {
     _displayOriginX = x;
     _displayOriginY = y;
-    _x = x + 1;
-    _y = y + 1;
-    parent.target?.inputModel.moveMouse(x, y);
+    if (updateCursorPos) {
+      _x = x + 1;
+      _y = y + 1;
+      parent.target?.inputModel.moveMouse(x, y);
+    }
     parent.target?.canvasModel.resetOffset();
     notifyListeners();
   }
@@ -1389,7 +2430,7 @@ class CursorModel with ChangeNotifier {
     _x = -10000;
     _x = -10000;
     _image = null;
-    _images.clear();
+    disposeImages();
 
     _clearCache();
     _cache = null;
@@ -1400,8 +2441,21 @@ class CursorModel with ChangeNotifier {
     final keys = {...cachedKeys};
     for (var k in keys) {
       debugPrint("deleting cursor with key $k");
-      CursorManager.instance.deleteCursor(k);
+      deleteCustomCursor(k);
     }
+    resetSystemCursor();
+  }
+
+  trySetRemoteWindowCoords() {
+    Future.delayed(Duration.zero, () async {
+      _windowRect =
+          await InputModel.fillRemoteCoordsAndGetCurFrame(_remoteWindowCoords);
+    });
+  }
+
+  clearRemoteWindowCoords() {
+    _windowRect = null;
+    _remoteWindowCoords.clear();
   }
 }
 
@@ -1411,6 +2465,7 @@ class QualityMonitorData {
   String? delay;
   String? targetBitrate;
   String? codecFormat;
+  String? chroma;
 }
 
 class QualityMonitorModel with ChangeNotifier {
@@ -1423,9 +2478,9 @@ class QualityMonitorModel with ChangeNotifier {
   bool get show => _show;
   QualityMonitorData get data => _data;
 
-  checkShowQualityMonitor(String id) async {
+  checkShowQualityMonitor(SessionID sessionId) async {
     final show = await bind.sessionGetToggleOption(
-            id: id, arg: 'show-quality-monitor') ==
+            sessionId: sessionId, arg: 'show-quality-monitor') ==
         true;
     if (_show != show) {
       _show = show;
@@ -1435,14 +2490,43 @@ class QualityMonitorModel with ChangeNotifier {
 
   updateQualityStatus(Map<String, dynamic> evt) {
     try {
-      if ((evt['speed'] as String).isNotEmpty) _data.speed = evt['speed'];
-      if ((evt['fps'] as String).isNotEmpty) _data.fps = evt['fps'];
-      if ((evt['delay'] as String).isNotEmpty) _data.delay = evt['delay'];
-      if ((evt['target_bitrate'] as String).isNotEmpty) {
+      if (evt.containsKey('speed') && (evt['speed'] as String).isNotEmpty) {
+        _data.speed = evt['speed'];
+      }
+      if (evt.containsKey('fps') && (evt['fps'] as String).isNotEmpty) {
+        final fps = jsonDecode(evt['fps']) as Map<String, dynamic>;
+        final pi = parent.target?.ffiModel.pi;
+        if (pi != null) {
+          final currentDisplay = pi.currentDisplay;
+          if (currentDisplay != kAllDisplayValue) {
+            final fps2 = fps[currentDisplay.toString()];
+            if (fps2 != null) {
+              _data.fps = fps2.toString();
+            }
+          } else if (fps.isNotEmpty) {
+            final fpsList = [];
+            for (var i = 0; i < pi.displays.length; i++) {
+              fpsList.add((fps[i.toString()] ?? 0).toString());
+            }
+            _data.fps = fpsList.join(' ');
+          }
+        } else {
+          _data.fps = null;
+        }
+      }
+      if (evt.containsKey('delay') && (evt['delay'] as String).isNotEmpty) {
+        _data.delay = evt['delay'];
+      }
+      if (evt.containsKey('target_bitrate') &&
+          (evt['target_bitrate'] as String).isNotEmpty) {
         _data.targetBitrate = evt['target_bitrate'];
       }
-      if ((evt['codec_format'] as String).isNotEmpty) {
+      if (evt.containsKey('codec_format') &&
+          (evt['codec_format'] as String).isNotEmpty) {
         _data.codecFormat = evt['codec_format'];
+      }
+      if (evt.containsKey('chroma') && (evt['chroma'] as String).isNotEmpty) {
+        _data.chroma = evt['chroma'];
       }
       notifyListeners();
     } catch (e) {
@@ -1455,36 +2539,24 @@ class RecordingModel with ChangeNotifier {
   WeakReference<FFI> parent;
   RecordingModel(this.parent);
   bool _start = false;
-  get start => _start;
+  bool get start => _start;
 
-  onSwitchDisplay() {
-    if (isIOS || !_start) return;
-    var id = parent.target?.id;
-    int? width = parent.target?.canvasModel.getDisplayWidth();
-    int? height = parent.target?.canvasModel.getDisplayHeight();
-    if (id == null || width == null || height == null) return;
-    bind.sessionRecordScreen(id: id, start: true, width: width, height: height);
-  }
-
-  toggle() {
+  toggle() async {
     if (isIOS) return;
-    var id = parent.target?.id;
-    if (id == null) return;
-    _start = !_start;
-    notifyListeners();
-    if (_start) {
-      bind.sessionRefresh(id: id);
-    } else {
-      bind.sessionRecordScreen(id: id, start: false, width: 0, height: 0);
+    final sessionId = parent.target?.sessionId;
+    if (sessionId == null) return;
+    final pi = parent.target?.ffiModel.pi;
+    if (pi == null) return;
+    bool value = !_start;
+    if (value) {
+      await sessionRefreshVideo(sessionId, pi);
     }
+    await bind.sessionRecordScreen(sessionId: sessionId, start: value);
   }
 
-  onClose() {
-    if (isIOS) return;
-    var id = parent.target?.id;
-    if (id == null) return;
-    _start = false;
-    bind.sessionRecordScreen(id: id, start: false, width: 0, height: 0);
+  updateStatus(bool status) {
+    _start = status;
+    notifyListeners();
   }
 }
 
@@ -1496,11 +2568,10 @@ class ElevationModel with ChangeNotifier {
   bool get showRequestMenu => _canElevate && !_running;
   onPeerInfo(PeerInfo pi) {
     _canElevate = pi.platform == kPeerPlatformWindows && pi.sasEnabled == false;
+    _running = false;
   }
 
-  onPortableServiceRunning(Map<String, dynamic> evt) {
-    _running = evt['running'] == 'true';
-  }
+  onPortableServiceRunning(bool running) => _running = running;
 }
 
 enum ConnType { defaultConn, fileTransfer, portForward, rdp }
@@ -1510,10 +2581,13 @@ class FFI {
   var id = '';
   var version = '';
   var connType = ConnType.defaultConn;
+  var closed = false;
+  var auditNote = '';
 
   /// dialogManager use late to ensure init after main page binding [globalKey]
   late final dialogManager = OverlayDialogManager();
 
+  late final SessionID sessionId;
   late final ImageModel imageModel; // session
   late final FfiModel ffiModel; // session
   late final CursorModel cursorModel; // session
@@ -1529,8 +2603,14 @@ class FFI {
   late final RecordingModel recordingModel; // session
   late final InputModel inputModel; // session
   late final ElevationModel elevationModel; // session
+  late final CmFileModel cmFileModel; // cm
+  late final TextureModel textureModel; //session
+  late final Peers recentPeersModel; // global
+  late final Peers favoritePeersModel; // global
+  late final Peers lanPeersModel; // global
 
-  FFI() {
+  FFI(SessionID? sId) {
+    sessionId = sId ?? (isDesktop ? Uuid().v4obj() : _constSessionId);
     imageModel = ImageModel(WeakReference(this));
     ffiModel = FfiModel(WeakReference(this));
     cursorModel = CursorModel(WeakReference(this));
@@ -1546,101 +2626,257 @@ class FFI {
     recordingModel = RecordingModel(WeakReference(this));
     inputModel = InputModel(WeakReference(this));
     elevationModel = ElevationModel(WeakReference(this));
+    cmFileModel = CmFileModel(WeakReference(this));
+    textureModel = TextureModel(WeakReference(this));
+    recentPeersModel = Peers(
+        name: PeersModelName.recent,
+        loadEvent: LoadEvent.recent,
+        getInitPeers: null);
+    favoritePeersModel = Peers(
+        name: PeersModelName.favorite,
+        loadEvent: LoadEvent.favorite,
+        getInitPeers: null);
+    lanPeersModel = Peers(
+        name: PeersModelName.lan, loadEvent: LoadEvent.lan, getInitPeers: null);
+  }
+
+  /// Mobile reuse FFI
+  void mobileReset() {
+    ffiModel.waitForFirstImage.value = true;
+    ffiModel.isRefreshing = false;
+    ffiModel.waitForImageDialogShow.value = true;
+    ffiModel.waitForImageTimer?.cancel();
+    ffiModel.waitForImageTimer = null;
   }
 
   /// Start with the given [id]. Only transfer file if [isFileTransfer], only port forward if [isPortForward].
-  void start(String id,
-      {bool isFileTransfer = false,
-      bool isPortForward = false,
-      String? switchUuid,
-      String? password,
-      bool? forceRelay}) {
+  void start(
+    String id, {
+    bool isFileTransfer = false,
+    bool isPortForward = false,
+    bool isRdp = false,
+    String? switchUuid,
+    String? password,
+    bool? isSharedPassword,
+    String? connToken,
+    bool? forceRelay,
+    int? tabWindowId,
+    int? display,
+    List<int>? displays,
+  }) {
+    closed = false;
+    auditNote = '';
+    if (isMobile) mobileReset();
     assert(!(isFileTransfer && isPortForward), 'more than one connect type');
     if (isFileTransfer) {
       connType = ConnType.fileTransfer;
-      id = 'ft_$id';
     } else if (isPortForward) {
       connType = ConnType.portForward;
-      id = 'pf_$id';
     } else {
       chatModel.resetClientMode();
+      connType = ConnType.defaultConn;
       canvasModel.id = id;
       imageModel.id = id;
-      cursorModel.id = id;
+      cursorModel.peerId = id;
     }
-    // ignore: unused_local_variable
-    final addRes = bind.sessionAddSync(
-      id: id,
-      isFileTransfer: isFileTransfer,
-      isPortForward: isPortForward,
-      switchUuid: switchUuid ?? "",
-      forceRelay: forceRelay ?? false,
-      password: password ?? "",
-    );
-    final stream = bind.sessionStart(id: id);
-    final cb = ffiModel.startEventListener(id);
-    () async {
-      final useTextureRender = bind.mainUseTextureRender();
-      // Preserved for the rgba data.
-      await for (final message in stream) {
+
+    final isNewPeer = tabWindowId == null;
+    // If tabWindowId != null, this session is a "tab -> window" one.
+    // Else this session is a new one.
+    if (isNewPeer) {
+      // ignore: unused_local_variable
+      final addRes = bind.sessionAddSync(
+        sessionId: sessionId,
+        id: id,
+        isFileTransfer: isFileTransfer,
+        isPortForward: isPortForward,
+        isRdp: isRdp,
+        switchUuid: switchUuid ?? '',
+        forceRelay: forceRelay ?? false,
+        password: password ?? '',
+        isSharedPassword: isSharedPassword ?? false,
+        connToken: connToken,
+      );
+    } else if (display != null) {
+      if (displays == null) {
+        debugPrint(
+            'Unreachable, failed to add existed session to $id, the displays is null while display is $display');
+        return;
+      }
+      final addRes = bind.sessionAddExistedSync(
+          id: id, sessionId: sessionId, displays: Int32List.fromList(displays));
+      if (addRes != '') {
+        debugPrint(
+            'Unreachable, failed to add existed session to $id, $addRes');
+        return;
+      }
+      ffiModel.pi.currentDisplay = display;
+    }
+    if (isDesktop && connType == ConnType.defaultConn) {
+      textureModel.updateCurrentDisplay(display ?? 0);
+    }
+
+    // CAUTION: `sessionStart()` and `sessionStartWithDisplays()` are an async functions.
+    // Though the stream is returned immediately, the stream may not be ready.
+    // Any operations that depend on the stream should be carefully handled.
+    late final Stream<EventToUI> stream;
+    if (isNewPeer || display == null || displays == null) {
+      stream = bind.sessionStart(sessionId: sessionId, id: id);
+    } else {
+      // We have to put displays in `sessionStart()` to make sure the stream is ready
+      // and then the displays' capturing requests can be sent.
+      stream = bind.sessionStartWithDisplays(
+          sessionId: sessionId, id: id, displays: Int32List.fromList(displays));
+    }
+
+    if (isWeb) {
+      platformFFI.setRgbaCallback((int display, Uint8List data) {
+        onEvent2UIRgba();
+        imageModel.onRgba(display, data);
+      });
+      this.id = id;
+      return;
+    }
+
+    final cb = ffiModel.startEventListener(sessionId, id);
+
+    imageModel.updateUserTextureRender();
+    final hasGpuTextureRender = bind.mainHasGpuTextureRender();
+    final SimpleWrapper<bool> isToNewWindowNotified = SimpleWrapper(false);
+    // Preserved for the rgba data.
+    stream.listen((message) {
+      if (closed) return;
+      if (tabWindowId != null && !isToNewWindowNotified.value) {
+        // Session is read to be moved to a new window.
+        // Get the cached data and handle the cached data.
+        Future.delayed(Duration.zero, () async {
+          final args = jsonEncode({'id': id, 'close': display == null});
+          final cachedData = await DesktopMultiWindow.invokeMethod(
+              tabWindowId, kWindowEventGetCachedSessionData, args);
+          if (cachedData == null) {
+            // unreachable
+            debugPrint('Unreachable, the cached data is empty.');
+            return;
+          }
+          final data = CachedPeerData.fromString(cachedData);
+          if (data == null) {
+            debugPrint('Unreachable, the cached data cannot be decoded.');
+            return;
+          }
+          ffiModel.setPermissions(data.permissions);
+          await ffiModel.handleCachedPeerData(data, id);
+          await sessionRefreshVideo(sessionId, ffiModel.pi);
+          await bind.sessionRequestNewDisplayInitMsgs(
+              sessionId: sessionId, display: ffiModel.pi.currentDisplay);
+        });
+        isToNewWindowNotified.value = true;
+      }
+      () async {
         if (message is EventToUI_Event) {
           if (message.field0 == "close") {
-            break;
+            closed = true;
+            debugPrint('Exit session event loop');
+            return;
           }
+
+          Map<String, dynamic>? event;
           try {
-            Map<String, dynamic> event = json.decode(message.field0);
-            await cb(event);
+            event = json.decode(message.field0);
           } catch (e) {
             debugPrint('json.decode fail1(): $e, ${message.field0}');
           }
-        } else if (message is EventToUI_Rgba) {
-          if (useTextureRender) {
-            if (_waitForImage[id]!) {
-              _waitForImage[id] = false;
-              dialogManager.dismissAll();
-              for (final cb in imageModel.callbacksOnFirstImage) {
-                cb(id);
-              }
-              await canvasModel.updateViewStyle();
-              await canvasModel.updateScrollStyle();
-            }
-          } else {
-            // Fetch the image buffer from rust codes.
-            final sz = platformFFI.getRgbaSize(id);
-            if (sz == null || sz == 0) {
-              return;
-            }
-            final rgba = platformFFI.getRgba(id, sz);
-            if (rgba != null) {
-              imageModel.onRgba(rgba);
-            }
+          if (event != null) {
+            await cb(event);
           }
+        } else if (message is EventToUI_Rgba) {
+          final display = message.field0;
+          // Fetch the image buffer from rust codes.
+          final sz = platformFFI.getRgbaSize(sessionId, display);
+          if (sz == 0) {
+            platformFFI.nextRgba(sessionId, display);
+            return;
+          }
+          final rgba = platformFFI.getRgba(sessionId, display, sz);
+          if (rgba != null) {
+            onEvent2UIRgba();
+            await imageModel.onRgba(display, rgba);
+          } else {
+            platformFFI.nextRgba(sessionId, display);
+          }
+        } else if (message is EventToUI_Texture) {
+          final display = message.field0;
+          final gpuTexture = message.field1;
+          debugPrint(
+              "EventToUI_Texture display:$display, gpuTexture:$gpuTexture");
+          if (gpuTexture && !hasGpuTextureRender) {
+            debugPrint('the gpuTexture is not supported.');
+            return;
+          }
+          textureModel.setTextureType(display: display, gpuTexture: gpuTexture);
+          onEvent2UIRgba();
         }
-      }
-      debugPrint('Exit session event loop');
-    }();
+      }();
+    });
     // every instance will bind a stream
     this.id = id;
   }
 
+  void onEvent2UIRgba() async {
+    if (ffiModel.waitForImageDialogShow.isTrue) {
+      ffiModel.waitForImageDialogShow.value = false;
+      ffiModel.waitForImageTimer?.cancel();
+      clearWaitingForImage(dialogManager, sessionId);
+    }
+    if (ffiModel.waitForFirstImage.value == true) {
+      ffiModel.waitForFirstImage.value = false;
+      dialogManager.dismissAll();
+      await canvasModel.updateViewStyle();
+      await canvasModel.updateScrollStyle();
+      for (final cb in imageModel.callbacksOnFirstImage) {
+        cb(id);
+      }
+    }
+  }
+
   /// Login with [password], choose if the client should [remember] it.
-  void login(String id, String password, bool remember) {
-    bind.sessionLogin(id: id, password: password, remember: remember);
+  void login(String osUsername, String osPassword, SessionID sessionId,
+      String password, bool remember) {
+    bind.sessionLogin(
+        sessionId: sessionId,
+        osUsername: osUsername,
+        osPassword: osPassword,
+        password: password,
+        remember: remember);
+  }
+
+  void send2FA(SessionID sessionId, String code, bool trustThisDevice) {
+    bind.sessionSend2Fa(
+        sessionId: sessionId, code: code, trustThisDevice: trustThisDevice);
   }
 
   /// Close the remote session.
-  Future<void> close() async {
+  Future<void> close({bool closeSession = true}) async {
+    closed = true;
     chatModel.close();
     if (imageModel.image != null && !isWebDesktop) {
-      await setCanvasConfig(id, cursorModel.x, cursorModel.y, canvasModel.x,
-          canvasModel.y, canvasModel.scale, ffiModel.pi.currentDisplay);
+      await setCanvasConfig(
+          sessionId,
+          cursorModel.x,
+          cursorModel.y,
+          canvasModel.x,
+          canvasModel.y,
+          canvasModel.scale,
+          ffiModel.pi.currentDisplay);
     }
-    imageModel.update(null);
+    imageModel.callbacksOnFirstImage.clear();
+    await imageModel.update(null);
     cursorModel.clear();
     ffiModel.clear();
     canvasModel.clear();
     inputModel.resetModifiers();
-    await bind.sessionClose(id: id);
+    if (closeSession) {
+      await bind.sessionClose(sessionId: sessionId);
+    }
     debugPrint('model $id closed');
     id = '';
   }
@@ -1654,12 +2890,19 @@ class FFI {
   }
 }
 
+const kInvalidResolutionValue = -1;
+const kVirtualDisplayResolutionValue = 0;
+
 class Display {
   double x = 0;
   double y = 0;
   int width = 0;
   int height = 0;
   bool cursorEmbedded = false;
+  int originalWidth = kInvalidResolutionValue;
+  int originalHeight = kInvalidResolutionValue;
+  double _scale = 1.0;
+  double get scale => _scale > 1.0 ? _scale : 1.0;
 
   Display() {
     width = (isDesktop || isWebDesktop)
@@ -1682,6 +2925,15 @@ class Display {
       other.width == width &&
       other.height == height &&
       other.cursorEmbedded == cursorEmbedded;
+
+  bool get isOriginalResolutionSet =>
+      originalWidth != kInvalidResolutionValue &&
+      originalHeight != kInvalidResolutionValue;
+  bool get isVirtualDisplayResolution =>
+      originalWidth == kVirtualDisplayResolutionValue &&
+      originalHeight == kVirtualDisplayResolutionValue;
+  bool get isOriginalResolution =>
+      width == originalWidth && height == originalHeight;
 }
 
 class Resolution {
@@ -1699,25 +2951,113 @@ class Features {
   bool privacyMode = false;
 }
 
-class PeerInfo {
+const kInvalidDisplayIndex = -1;
+
+class PeerInfo with ChangeNotifier {
   String version = '';
   String username = '';
   String hostname = '';
   String platform = '';
   bool sasEnabled = false;
+  bool isSupportMultiUiSession = false;
   int currentDisplay = 0;
-  List<Display> displays = [];
+  int primaryDisplay = kInvalidDisplayIndex;
+  RxList<Display> displays = <Display>[].obs;
   Features features = Features();
   List<Resolution> resolutions = [];
-  Map<String, dynamic> platform_additions = {};
+  Map<String, dynamic> platformAdditions = {};
 
-  bool get is_wayland => platform_additions['is_wayland'] == true;
+  RxInt displaysCount = 0.obs;
+  RxBool isSet = false.obs;
+
+  bool get isWayland => platformAdditions[kPlatformAdditionsIsWayland] == true;
+  bool get isHeadless => platformAdditions[kPlatformAdditionsHeadless] == true;
+  bool get isInstalled =>
+      platform != kPeerPlatformWindows ||
+      platformAdditions[kPlatformAdditionsIsInstalled] == true;
+  List<int> get RustDeskVirtualDisplays => List<int>.from(
+      platformAdditions[kPlatformAdditionsRustDeskVirtualDisplays] ?? []);
+  int get amyuniVirtualDisplayCount =>
+      platformAdditions[kPlatformAdditionsAmyuniVirtualDisplays] ?? 0;
+
+  bool get isSupportMultiDisplay =>
+      (isDesktop || isWebDesktop) && isSupportMultiUiSession;
+  bool get forceTextureRender => currentDisplay == kAllDisplayValue;
+
+  bool get cursorEmbedded => tryGetDisplay()?.cursorEmbedded ?? false;
+
+  bool get isRustDeskIdd =>
+      platformAdditions[kPlatformAdditionsIddImpl] == 'rustdesk_idd';
+  bool get isAmyuniIdd =>
+      platformAdditions[kPlatformAdditionsIddImpl] == 'amyuni_idd';
+
+  Display? tryGetDisplay({int? display}) {
+    if (displays.isEmpty) {
+      return null;
+    }
+    display ??= currentDisplay;
+    if (display == kAllDisplayValue) {
+      return displays[0];
+    } else {
+      if (display > 0 && display < displays.length) {
+        return displays[display];
+      } else {
+        return displays[0];
+      }
+    }
+  }
+
+  Display? tryGetDisplayIfNotAllDisplay({int? display}) {
+    if (displays.isEmpty) {
+      return null;
+    }
+    display ??= currentDisplay;
+    if (display == kAllDisplayValue) {
+      return null;
+    }
+    if (display >= 0 && display < displays.length) {
+      return displays[display];
+    } else {
+      return null;
+    }
+  }
+
+  List<Display> getCurDisplays() {
+    if (currentDisplay == kAllDisplayValue) {
+      return displays;
+    } else {
+      if (currentDisplay >= 0 && currentDisplay < displays.length) {
+        return [displays[currentDisplay]];
+      } else {
+        return [];
+      }
+    }
+  }
+
+  double scaleOfDisplay(int display) {
+    if (display >= 0 && display < displays.length) {
+      return displays[display].scale;
+    }
+    return 1.0;
+  }
+
+  Rect? getDisplayRect(int display) {
+    final d = tryGetDisplayIfNotAllDisplay(display: display);
+    if (d == null) return null;
+    return Rect.fromLTWH(d.x, d.y, d.width.toDouble(), d.height.toDouble());
+  }
 }
 
 const canvasKey = 'canvas';
 
-Future<void> setCanvasConfig(String id, double xCursor, double yCursor,
-    double xCanvas, double yCanvas, double scale, int currentDisplay) async {
+Future<void> setCanvasConfig(
+    SessionID sessionId,
+    double xCursor,
+    double yCursor,
+    double xCanvas,
+    double yCanvas,
+    double scale,
+    int currentDisplay) async {
   final p = <String, dynamic>{};
   p['xCursor'] = xCursor;
   p['yCursor'] = yCursor;
@@ -1725,12 +3065,14 @@ Future<void> setCanvasConfig(String id, double xCursor, double yCursor,
   p['yCanvas'] = yCanvas;
   p['scale'] = scale;
   p['currentDisplay'] = currentDisplay;
-  await bind.sessionSetFlutterConfig(id: id, k: canvasKey, v: jsonEncode(p));
+  await bind.sessionSetFlutterOption(
+      sessionId: sessionId, k: canvasKey, v: jsonEncode(p));
 }
 
-Future<Map<String, dynamic>?> getCanvasConfig(String id) async {
+Future<Map<String, dynamic>?> getCanvasConfig(SessionID sessionId) async {
   if (!isWebDesktop) return null;
-  var p = await bind.sessionGetFlutterConfig(id: id, k: canvasKey);
+  var p =
+      await bind.sessionGetFlutterOption(sessionId: sessionId, k: canvasKey);
   if (p == null || p.isEmpty) return null;
   try {
     Map<String, dynamic> m = json.decode(p);
@@ -1740,19 +3082,15 @@ Future<Map<String, dynamic>?> getCanvasConfig(String id) async {
   }
 }
 
-void removePreference(String id) async {
-  await bind.sessionSetFlutterConfig(id: id, k: canvasKey, v: '');
-}
-
 Future<void> initializeCursorAndCanvas(FFI ffi) async {
-  var p = await getCanvasConfig(ffi.id);
+  var p = await getCanvasConfig(ffi.sessionId);
   int currentDisplay = 0;
   if (p != null) {
     currentDisplay = p['currentDisplay'];
   }
   if (p == null || currentDisplay != ffi.ffiModel.pi.currentDisplay) {
-    ffi.cursorModel
-        .updateDisplayOrigin(ffi.ffiModel.display.x, ffi.ffiModel.display.y);
+    ffi.cursorModel.updateDisplayOrigin(
+        ffi.ffiModel.rect?.left ?? 0, ffi.ffiModel.rect?.top ?? 0);
     return;
   }
   double xCursor = p['xCursor'];
@@ -1760,7 +3098,11 @@ Future<void> initializeCursorAndCanvas(FFI ffi) async {
   double xCanvas = p['xCanvas'];
   double yCanvas = p['yCanvas'];
   double scale = p['scale'];
-  ffi.cursorModel.updateDisplayOriginWithCursor(
-      ffi.ffiModel.display.x, ffi.ffiModel.display.y, xCursor, yCursor);
+  ffi.cursorModel.updateDisplayOriginWithCursor(ffi.ffiModel.rect?.left ?? 0,
+      ffi.ffiModel.rect?.top ?? 0, xCursor, yCursor);
   ffi.canvasModel.update(xCanvas, yCanvas, scale);
+}
+
+clearWaitingForImage(OverlayDialogManager? dialogManager, SessionID sessionId) {
+  dialogManager?.dismissByTag('$sessionId-waiting-for-image');
 }

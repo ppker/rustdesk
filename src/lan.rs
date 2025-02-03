@@ -1,7 +1,8 @@
+use hbb_common::config::Config;
 use hbb_common::{
     allow_err,
     anyhow::bail,
-    config::{self, Config, RENDEZVOUS_PORT},
+    config::{self, RENDEZVOUS_PORT},
     log,
     protobuf::Message as _,
     rendezvous_proto::*,
@@ -11,6 +12,7 @@ use hbb_common::{
     },
     ResultType,
 };
+
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
@@ -19,6 +21,7 @@ use std::{
 
 type Message = RendezvousMessage;
 
+#[cfg(not(target_os = "ios"))]
 pub(super) fn start_listening() -> ResultType<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], get_broadcast_port()));
     let socket = std::net::UdpSocket::bind(addr)?;
@@ -30,15 +33,28 @@ pub(super) fn start_listening() -> ResultType<()> {
             if let Ok(msg_in) = Message::parse_from_bytes(&buf[0..len]) {
                 match msg_in.union {
                     Some(rendezvous_message::Union::PeerDiscovery(p)) => {
-                        if p.cmd == "ping" && Config::get_option("enable-lan-discovery").is_empty()
+                        if p.cmd == "ping"
+                            && config::option2bool(
+                                "enable-lan-discovery",
+                                &Config::get_option("enable-lan-discovery"),
+                            )
                         {
+                            let id = Config::get_id();
+                            if p.id == id {
+                                continue;
+                            }
                             if let Some(self_addr) = get_ipaddr_by_peer(&addr) {
                                 let mut msg_out = Message::new();
+                                let mut hostname = whoami::hostname();
+                                // The default hostname is "localhost" which is a bit confusing
+                                if hostname == "localhost" {
+                                    hostname = "unknown".to_owned();
+                                }
                                 let peer = PeerDiscovery {
                                     cmd: "pong".to_owned(),
                                     mac: get_mac(&self_addr),
-                                    id: Config::get_id(),
-                                    hostname: whoami::hostname(),
+                                    id,
+                                    hostname,
                                     username: crate::platform::get_active_username(),
                                     platform: whoami::platform().to_string(),
                                     ..Default::default()
@@ -69,21 +85,14 @@ pub fn send_wol(id: String) {
     let interfaces = default_net::get_interfaces();
     for peer in &config::LanPeers::load().peers {
         if peer.id == id {
-            for (ip, mac) in peer.ip_mac.iter() {
+            for (_, mac) in peer.ip_mac.iter() {
                 if let Ok(mac_addr) = mac.parse() {
-                    if let Ok(IpAddr::V4(ip)) = ip.parse() {
-                        for interface in &interfaces {
-                            for ipv4 in &interface.ipv4 {
-                                if (u32::from(ipv4.addr) & u32::from(ipv4.netmask))
-                                    == (u32::from(ip) & u32::from(ipv4.netmask))
-                                {
-                                    allow_err!(wol::send_wol(
-                                        mac_addr,
-                                        None,
-                                        Some(IpAddr::V4(ipv4.addr))
-                                    ));
-                                }
-                            }
+                    for interface in &interfaces {
+                        for ipv4 in &interface.ipv4 {
+                            // remove below mask check to avoid unexpected bug
+                            // if (u32::from(ipv4.addr) & u32::from(ipv4.netmask)) == (u32::from(peer_ip) & u32::from(ipv4.netmask))
+                            log::info!("Send wol to {mac_addr} of {}", ipv4.addr);
+                            allow_err!(wol::send_wol(mac_addr, None, Some(IpAddr::V4(ipv4.addr))));
                         }
                     }
                 }
@@ -98,27 +107,18 @@ fn get_broadcast_port() -> u16 {
     (RENDEZVOUS_PORT + 3) as _
 }
 
-fn get_mac(ip: &IpAddr) -> String {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    if let Ok(mac) = get_mac_by_ip(ip) {
+fn get_mac(_ip: &IpAddr) -> String {
+    #[cfg(not(target_os = "ios"))]
+    if let Ok(mac) = get_mac_by_ip(_ip) {
         mac.to_string()
     } else {
         "".to_owned()
     }
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(target_os = "ios")]
     "".to_owned()
 }
 
-fn get_all_ipv4s() -> ResultType<Vec<Ipv4Addr>> {
-    let mut ipv4s = Vec::new();
-    for interface in default_net::get_interfaces() {
-        for ipv4 in &interface.ipv4 {
-            ipv4s.push(ipv4.addr.clone());
-        }
-    }
-    Ok(ipv4s)
-}
-
+#[cfg(not(target_os = "ios"))]
 fn get_mac_by_ip(ip: &IpAddr) -> ResultType<String> {
     for interface in default_net::get_interfaces() {
         match ip {
@@ -159,34 +159,58 @@ fn get_ipaddr_by_peer<A: ToSocketAddrs>(peer: A) -> Option<IpAddr> {
     };
 }
 
-fn create_broadcast_sockets() -> ResultType<Vec<UdpSocket>> {
-    let mut sockets = Vec::new();
-    for v4_addr in get_all_ipv4s()? {
-        if v4_addr.is_private() {
-            let s = UdpSocket::bind(SocketAddr::from((v4_addr, 0)))?;
-            s.set_broadcast(true)?;
-            log::debug!("Bind socket to {}", &v4_addr);
-            sockets.push(s)
+fn create_broadcast_sockets() -> Vec<UdpSocket> {
+    let mut ipv4s = Vec::new();
+    // TODO: maybe we should use a better way to get ipv4 addresses.
+    // But currently, it's ok to use `[Ipv4Addr::UNSPECIFIED]` for discovery.
+    // `default_net::get_interfaces()` causes undefined symbols error when `flutter build` on iOS simulator x86_64
+    #[cfg(not(any(target_os = "ios")))]
+    for interface in default_net::get_interfaces() {
+        for ipv4 in &interface.ipv4 {
+            ipv4s.push(ipv4.addr.clone());
         }
     }
-    Ok(sockets)
+    ipv4s.push(Ipv4Addr::UNSPECIFIED); // for robustness
+    let mut sockets = Vec::new();
+    for v4_addr in ipv4s {
+        // removing v4_addr.is_private() check, https://github.com/rustdesk/rustdesk/issues/4663
+        if let Ok(s) = UdpSocket::bind(SocketAddr::from((v4_addr, 0))) {
+            if s.set_broadcast(true).is_ok() {
+                sockets.push(s);
+            }
+        }
+    }
+    sockets
 }
 
 fn send_query() -> ResultType<Vec<UdpSocket>> {
-    let sockets = create_broadcast_sockets()?;
+    let sockets = create_broadcast_sockets();
     if sockets.is_empty() {
-        bail!("Found no ipv4 addresses");
+        bail!("Found no bindable ipv4 addresses");
     }
 
     let mut msg_out = Message::new();
+    // We may not be able to get the mac address on mobile platforms.
+    // So we need to use the id to avoid discovering ourselves.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let id = crate::ui_interface::get_id();
+    // `crate::ui_interface::get_id()` will cause error:
+    // `get_id()` uses async code with `current_thread`, which is not allowed in this context.
+    //
+    // No need to get id for desktop platforms.
+    // We can use the mac address to identify the device.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let id = "".to_owned();
     let peer = PeerDiscovery {
         cmd: "ping".to_owned(),
+        id,
         ..Default::default()
     };
     msg_out.set_peer_discovery(peer);
+    let out = msg_out.write_to_bytes()?;
     let maddr = SocketAddr::from(([255, 255, 255, 255], get_broadcast_port()));
     for socket in &sockets {
-        socket.send_to(&msg_out.write_to_bytes()?, maddr)?;
+        allow_err!(socket.send_to(&out, maddr));
     }
     log::info!("discover ping sent");
     Ok(sockets)
@@ -199,6 +223,13 @@ fn wait_response(
 ) -> ResultType<()> {
     let mut last_recv_time = Instant::now();
 
+    let local_addr = socket.local_addr();
+    let try_get_ip_by_peer = match local_addr.as_ref() {
+        Err(..) => true,
+        Ok(addr) => addr.ip().is_unspecified(),
+    };
+    let mut mac: Option<String> = None;
+
     socket.set_read_timeout(timeout)?;
     loop {
         let mut buf = [0; 2048];
@@ -208,13 +239,28 @@ fn wait_response(
                     Some(rendezvous_message::Union::PeerDiscovery(p)) => {
                         last_recv_time = Instant::now();
                         if p.cmd == "pong" {
-                            let mac = if let Some(self_addr) = get_ipaddr_by_peer(&addr) {
-                                get_mac(&self_addr)
+                            let local_mac = if try_get_ip_by_peer {
+                                if let Some(self_addr) = get_ipaddr_by_peer(&addr) {
+                                    get_mac(&self_addr)
+                                } else {
+                                    "".to_owned()
+                                }
                             } else {
-                                "".to_owned()
+                                match mac.as_ref() {
+                                    Some(m) => m.clone(),
+                                    None => {
+                                        let m = if let Ok(local_addr) = local_addr {
+                                            get_mac(&local_addr.ip())
+                                        } else {
+                                            "".to_owned()
+                                        };
+                                        mac = Some(m.clone());
+                                        m
+                                    }
+                                }
                             };
 
-                            if mac != p.mac {
+                            if local_mac.is_empty() && p.mac.is_empty() || local_mac != p.mac {
                                 allow_err!(tx.send(config::DiscoveryPeer {
                                     id: p.id.clone(),
                                     ip_mac: HashMap::from([
@@ -261,7 +307,7 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
     });
 
     let mut response_set = HashSet::new();
-    let mut last_write_time = Instant::now() - std::time::Duration::from_secs(4);
+    let mut last_write_time: Option<Instant> = None;
     loop {
         tokio::select! {
             data = rx.recv() => match data {
@@ -275,11 +321,11 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
                         }
                     }
                     peers.insert(0, peer);
-                    if last_write_time.elapsed().as_millis() > 300 {
+                    if last_write_time.map(|t| t.elapsed().as_millis() > 300).unwrap_or(true)  {
                         config::LanPeers::store(&peers);
                         #[cfg(feature = "flutter")]
                         crate::flutter_ffi::main_load_lan_peers();
-                        last_write_time = Instant::now();
+                        last_write_time = Some(Instant::now());
                     }
                 }
                 None => {

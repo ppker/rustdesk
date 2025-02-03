@@ -3,6 +3,20 @@ use hbb_common::message_proto::*;
 
 pub fn clip_2_msg(clip: ClipboardFile) -> Message {
     match clip {
+        ClipboardFile::NotifyCallback {
+            r#type,
+            title,
+            text,
+        } => Message {
+            union: Some(message::Union::MessageBox(MessageBox {
+                msgtype: r#type,
+                title,
+                text,
+                link: "".to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
         ClipboardFile::MonitorReady => Message {
             union: Some(message::Union::Cliprdr(Cliprdr {
                 union: Some(cliprdr::Union::Ready(CliprdrMonitorReady {
@@ -120,6 +134,15 @@ pub fn clip_2_msg(clip: ClipboardFile) -> Message {
             })),
             ..Default::default()
         },
+        ClipboardFile::TryEmpty => Message {
+            union: Some(message::Union::Cliprdr(Cliprdr {
+                union: Some(cliprdr::Union::TryEmpty(CliprdrTryEmpty {
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
     }
 }
 
@@ -162,6 +185,7 @@ pub fn msg_2_clip(msg: Cliprdr) -> Option<ClipboardFile> {
                 requested_data: data.requested_data.into(),
             })
         }
+        Some(cliprdr::Union::TryEmpty(_)) => Some(ClipboardFile::TryEmpty),
         _ => None,
     }
 }

@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     iter::FromIterator,
-    process::Child,
     sync::{Arc, Mutex},
 };
 
@@ -22,7 +21,6 @@ mod cm;
 pub mod inline;
 pub mod remote;
 
-pub type Children = Arc<Mutex<(bool, HashMap<(String, String), Child>)>>;
 #[allow(dead_code)]
 type Status = (i32, bool, i64, String);
 
@@ -34,7 +32,6 @@ lazy_static::lazy_static! {
 #[cfg(not(any(feature = "flutter", feature = "cli")))]
 lazy_static::lazy_static! {
     pub static ref CUR_SESSION: Arc<Mutex<Option<Session<remote::SciterHandler>>>> = Default::default();
-    static ref CHILDREN : Children = Default::default();
 }
 
 struct UIHostHandler;
@@ -44,15 +41,35 @@ pub fn start(args: &mut [String]) {
     crate::platform::delegate::show_dock();
     #[cfg(all(target_os = "linux", feature = "inline"))]
     {
-        #[cfg(feature = "appimage")]
-        let prefix = std::env::var("APPDIR").unwrap_or("".to_string());
-        #[cfg(not(feature = "appimage"))]
-        let prefix = "".to_string();
-        #[cfg(feature = "flatpak")]
-        let dir = "/app";
-        #[cfg(not(feature = "flatpak"))]
-        let dir = "/usr";
-        sciter::set_library(&(prefix + dir + "/lib/rustdesk/libsciter-gtk.so")).ok();
+        let app_dir = std::env::var("APPDIR").unwrap_or("".to_string());
+        let mut so_path = "/usr/share/rustdesk/libsciter-gtk.so".to_owned();
+        for (prefix, dir) in [
+            ("", "/usr"),
+            ("", "/app"),
+            (&app_dir, "/usr"),
+            (&app_dir, "/app"),
+        ]
+        .iter()
+        {
+            let path = format!("{prefix}{dir}/share/rustdesk/libsciter-gtk.so");
+            if std::path::Path::new(&path).exists() {
+                so_path = path;
+                break;
+            }
+        }
+        sciter::set_library(&so_path).ok();
+    }
+    #[cfg(windows)]
+    // Check if there is a sciter.dll nearby.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let sciter_dll_path = parent.join("sciter.dll");
+            if sciter_dll_path.exists() {
+                // Try to set the sciter dll.
+                let p = sciter_dll_path.to_string_lossy().to_string();
+                log::debug!("Found dll:{}, \n {:?}", p, sciter::set_library(&p));
+            }
+        }
     }
     // https://github.com/c-smile/sciter-sdk/blob/master/include/sciter-x-types.h
     // https://github.com/rustdesk/rustdesk/issues/132#issuecomment-886069737
@@ -60,10 +77,6 @@ pub fn start(args: &mut [String]) {
     allow_err!(sciter::set_options(sciter::RuntimeOptions::GfxLayer(
         sciter::GFX_LAYER::WARP
     )));
-    #[cfg(all(windows, not(feature = "inline")))]
-    unsafe {
-        winapi::um::shellscalingapi::SetProcessDpiAwareness(2);
-    }
     use sciter::SCRIPT_RUNTIME_FEATURES::*;
     allow_err!(sciter::set_options(sciter::RuntimeOptions::ScriptFeatures(
         ALLOW_FILE_IO as u8 | ALLOW_SOCKET_IO as u8 | ALLOW_EVAL as u8 | ALLOW_SYSINFO as u8
@@ -74,6 +87,8 @@ pub fn start(args: &mut [String]) {
     frame.set_title(&crate::get_app_name());
     #[cfg(target_os = "macos")]
     crate::platform::delegate::make_menubar(frame.get_host(), args.is_empty());
+    #[cfg(windows)]
+    crate::platform::try_set_window_foreground(frame.get_hwnd() as _);
     let page;
     if args.len() > 1 && args[0] == "--play" {
         args[0] = "--connect".to_owned();
@@ -86,8 +101,7 @@ pub fn start(args: &mut [String]) {
         args[1] = id;
     }
     if args.is_empty() {
-        let children: Children = Default::default();
-        std::thread::spawn(move || check_zombie(children));
+        std::thread::spawn(move || check_zombie());
         crate::common::check_software_update();
         frame.event_handler(UI {});
         frame.sciter_handler(UIHostHandler {});
@@ -116,8 +130,16 @@ pub fn start(args: &mut [String]) {
             crate::platform::windows::enable_lowlevel_keyboard(hw as _);
         }
         let mut iter = args.iter();
-        let cmd = iter.next().unwrap().clone();
-        let id = iter.next().unwrap().clone();
+        let Some(cmd) = iter.next() else {
+            log::error!("Failed to get cmd arg");
+            return;
+        };
+        let cmd = cmd.to_owned();
+        let Some(id) = iter.next() else {
+            log::error!("Failed to get id arg");
+            return;
+        };
+        let id = id.to_owned();
         let pass = iter.next().unwrap_or(&"".to_owned()).clone();
         let args: Vec<String> = iter.map(|x| x.clone()).collect();
         frame.set_title(&id);
@@ -247,11 +269,12 @@ impl UI {
     }
 
     fn using_public_server(&self) -> bool {
-        using_public_server()
+        crate::using_public_server()
     }
 
     fn get_options(&self) -> Value {
-        let hashmap: HashMap<String, String> = serde_json::from_str(&get_options()).unwrap();
+        let hashmap: HashMap<String, String> =
+            serde_json::from_str(&get_options()).unwrap_or_default();
         let mut m = Value::map();
         for (k, v) in hashmap {
             m.set_item(k, v);
@@ -259,8 +282,8 @@ impl UI {
         m
     }
 
-    fn test_if_valid_server(&self, host: String) -> String {
-        test_if_valid_server(host)
+    fn test_if_valid_server(&self, host: String, test_with_proxy: bool) -> String {
+        test_if_valid_server(host, test_with_proxy)
     }
 
     fn get_sound_inputs(&self) -> Value {
@@ -289,6 +312,10 @@ impl UI {
         install_path()
     }
 
+    fn install_options(&self) -> String {
+        install_options()
+    }
+
     fn get_socks(&self) -> Value {
         Value::from_iter(get_socks())
     }
@@ -310,10 +337,6 @@ impl UI {
         return true;
         #[cfg(debug_assertions)]
         return false;
-    }
-
-    fn is_rdp_service_open(&self) -> bool {
-        is_rdp_service_open()
     }
 
     fn is_share_rdp(&self) -> bool {
@@ -354,9 +377,9 @@ impl UI {
     fn get_connect_status(&mut self) -> Value {
         let mut v = Value::array(0);
         let x = get_connect_status();
-        v.push(x.0);
-        v.push(x.1);
-        v.push(x.3);
+        v.push(x.status_num);
+        v.push(x.key_confirmed);
+        v.push(x.id);
         v
     }
 
@@ -395,7 +418,7 @@ impl UI {
 
     fn get_recent_sessions(&mut self) -> Value {
         // to-do: limit number of recent sessions, and remove old peer file
-        let peers: Vec<Value> = PeerConfig::peers()
+        let peers: Vec<Value> = PeerConfig::peers(None)
             .drain(..)
             .map(|p| Self::get_peer_value(p.0, p.2))
             .collect();
@@ -456,6 +479,10 @@ impl UI {
 
     fn get_version(&self) -> String {
         get_version()
+    }
+
+    fn get_fingerprint(&self) -> String {
+        get_fingerprint()
     }
 
     fn get_app_name(&self) -> String {
@@ -530,8 +557,13 @@ impl UI {
     }
 
     fn change_id(&self, id: String) {
+        reset_async_job_status();
         let old_id = self.get_id();
         change_id_shared(id, old_id);
+    }
+
+    fn http_request(&self, url: String, method: String, body: Option<String>, header: String) {
+        http_request(url, method, body, header)
     }
 
     fn post_request(&self, url: String, body: String, header: String) {
@@ -539,11 +571,15 @@ impl UI {
     }
 
     fn is_ok_change_id(&self) -> bool {
-        machine_uid::get().is_ok()
+        hbb_common::machine_uid::get().is_ok()
     }
 
     fn get_async_job_status(&self) -> String {
         get_async_job_status()
+    }
+
+    fn get_http_status(&self, url: String) -> Option<String> {
+        get_async_http_status(url)
     }
 
     fn t(&self, name: String) -> String {
@@ -562,16 +598,54 @@ impl UI {
         has_hwcodec()
     }
 
+    fn has_vram(&self) -> bool {
+        has_vram()
+    }
+
     fn get_langs(&self) -> String {
         get_langs()
     }
 
-    fn default_video_save_directory(&self) -> String {
-        default_video_save_directory()
+    fn video_save_directory(&self, root: bool) -> String {
+        video_save_directory(root)
     }
 
     fn handle_relay_id(&self, id: String) -> String {
-        handle_relay_id(id)
+        handle_relay_id(&id).to_owned()
+    }
+
+    fn get_login_device_info(&self) -> String {
+        get_login_device_info_json()
+    }
+
+    fn support_remove_wallpaper(&self) -> bool {
+        support_remove_wallpaper()
+    }
+
+    fn has_valid_2fa(&self) -> bool {
+        has_valid_2fa()
+    }
+
+    fn generate2fa(&self) -> String {
+        generate2fa()
+    }
+
+    pub fn verify2fa(&self, code: String) -> bool {
+        verify2fa(code)
+    }
+
+    fn generate_2fa_img_src(&self, data: String) -> String {
+        let v = qrcode_generator::to_png_to_vec(data, qrcode_generator::QrCodeEcc::Low, 128)
+            .unwrap_or_default();
+        let s = hbb_common::sodiumoxide::base64::encode(
+            v,
+            hbb_common::sodiumoxide::base64::Variant::Original,
+        );
+        format!("data:image/png;base64,{s}")
+    }
+
+    pub fn check_hwcodec(&self) {
+        check_hwcodec()
     }
 }
 
@@ -609,11 +683,11 @@ impl sciter::EventHandler for UI {
         fn is_release();
         fn set_socks(String, String, String);
         fn get_socks();
-        fn is_rdp_service_open();
         fn is_share_rdp();
         fn set_share_rdp(bool);
         fn is_installed_lower_version();
         fn install_path();
+        fn install_options();
         fn goto_install();
         fn is_process_trusted(bool);
         fn is_can_screen_recording(bool);
@@ -630,13 +704,14 @@ impl sciter::EventHandler for UI {
         fn forget_password(String);
         fn set_peer_option(String, String, String);
         fn get_license();
-        fn test_if_valid_server(String);
+        fn test_if_valid_server(String, bool);
         fn get_sound_inputs();
         fn set_options(Value);
         fn set_option(String, String);
         fn get_software_update_url();
         fn get_new_version();
         fn get_version();
+        fn get_fingerprint();
         fn update_me(String);
         fn show_run_without_install();
         fn run_without_install();
@@ -653,37 +728,23 @@ impl sciter::EventHandler for UI {
         fn get_lan_peers();
         fn get_uuid();
         fn has_hwcodec();
+        fn has_vram();
         fn get_langs();
-        fn default_video_save_directory();
+        fn video_save_directory(bool);
         fn handle_relay_id(String);
+        fn get_login_device_info();
+        fn support_remove_wallpaper();
+        fn has_valid_2fa();
+        fn generate2fa();
+        fn generate_2fa_img_src(String);
+        fn verify2fa(String);
+        fn check_hwcodec();
     }
 }
 
 impl sciter::host::HostHandler for UIHostHandler {
     fn on_graphics_critical_failure(&mut self) {
         log::error!("Critical rendering error: e.g. DirectX gfx driver error. Most probably bad gfx drivers.");
-    }
-}
-
-pub fn check_zombie(children: Children) {
-    let mut deads = Vec::new();
-    loop {
-        let mut lock = children.lock().unwrap();
-        let mut n = 0;
-        for (id, c) in lock.1.iter_mut() {
-            if let Ok(Some(_)) = c.try_wait() {
-                deads.push(id.clone());
-                n += 1;
-            }
-        }
-        for ref id in deads.drain(..) {
-            lock.1.remove(id);
-        }
-        if n > 0 {
-            lock.0 = true;
-        }
-        drop(lock);
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -718,50 +779,6 @@ pub fn value_crash_workaround(values: &[Value]) -> Arc<Vec<Value>> {
     let persist = Arc::new(values.to_vec());
     STUPID_VALUES.lock().unwrap().push(persist.clone());
     persist
-}
-
-#[inline]
-pub fn new_remote(id: String, remote_type: String, force_relay: bool) {
-    let mut lock = CHILDREN.lock().unwrap();
-    let mut args = vec![format!("--{}", remote_type), id.clone()];
-    if force_relay {
-        args.push("".to_string()); // password
-        args.push("--relay".to_string());
-    }
-    let key = (id.clone(), remote_type.clone());
-    if let Some(c) = lock.1.get_mut(&key) {
-        if let Ok(Some(_)) = c.try_wait() {
-            lock.1.remove(&key);
-        } else {
-            if remote_type == "rdp" {
-                allow_err!(c.kill());
-                std::thread::sleep(std::time::Duration::from_millis(30));
-                c.try_wait().ok();
-                lock.1.remove(&key);
-            } else {
-                return;
-            }
-        }
-    }
-    match crate::run_me(args) {
-        Ok(child) => {
-            lock.1.insert(key, child);
-        }
-        Err(err) => {
-            log::error!("Failed to spawn remote: {}", err);
-        }
-    }
-}
-
-#[inline]
-pub fn recent_sessions_updated() -> bool {
-    let mut children = CHILDREN.lock().unwrap();
-    if children.0 {
-        children.0 = false;
-        true
-    } else {
-        false
-    }
 }
 
 pub fn get_icon() -> String {

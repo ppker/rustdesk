@@ -48,3 +48,10 @@ lib/generated_bridge.dart
 .vscode-server/
 .ssh
 .devcontainer/.*
+# build cache in examples
+examples/**/target/
+# ===
+vcpkg_installed
+flutter/lib/generated_plugin_registrant.dart
+libsciter.dylib
+flutter/web/
