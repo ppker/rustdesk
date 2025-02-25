@@ -241,8 +241,8 @@ function msgbox(type, title, content, link="", callback=null, height=180, width=
     }
     var remember = false;
     try { remember = handler.get_remember(); } catch(e) {}
-    var auto_login = false;
-    try { auto_login = handler.get_option("auto-login") != ''; } catch(e) {}
+    var autoLogin = false;
+    try { autoLogin = handler.get_option("auto-login") != ''; } catch(e) {}
     width += is_xfce ? 50 : 0;
     height += is_xfce ? 50 : 0;
 
@@ -252,12 +252,45 @@ function msgbox(type, title, content, link="", callback=null, height=180, width=
                 view.close();
                 return;
             }
-            handler.login(res.password, res.remember); 
+            handler.login("", "", res.password, res.remember); 
             if (!is_port_forward) {
               // Specially handling file transfer for no permission hanging issue (including 60ms
               // timer in setPermission.
               // For wrong password input hanging issue, we can not use handler.msgbox.
               // But how about wrong password for file transfer?
+              if (is_file_transfer) handler.msgbox("connecting", "Connecting...", "Logging in...");
+              else msgbox("connecting", "Connecting...", "Logging in...");
+            }
+        };
+    } else if (type.indexOf("input-2fa") >= 0) {
+        callback = function (res) {
+            if (!res) {
+                view.close();
+                return;
+            }
+            handler.send2fa(res.code, res.trust_this_device || false); 
+            msgbox("connecting", "Connecting...", "Logging in...");
+        };
+    } else if (type == "session-login" || type == "session-re-login") {
+        callback = function (res) {
+            if (!res) {
+                view.close();
+                return;
+            }
+            handler.login(res.osusername, res.ospassword, "", false);
+            if (!is_port_forward) {
+              if (is_file_transfer) handler.msgbox("connecting", "Connecting...", "Logging in...");
+              else msgbox("connecting", "Connecting...", "Logging in...");
+            }
+        };
+    } else if (type.indexOf("session-login") >= 0) {
+        callback = function (res) {
+            if (!res) {
+                view.close();
+                return;
+            }
+            handler.login(res.osusername, res.ospassword, res.password, res.remember);
+            if (!is_port_forward) {
               if (is_file_transfer) handler.msgbox("connecting", "Connecting...", "Logging in...");
               else msgbox("connecting", "Connecting...", "Logging in...");
             }
@@ -273,7 +306,7 @@ function msgbox(type, title, content, link="", callback=null, height=180, width=
         };
     }
     last_msgbox_tag = type + "-" + title + "-" + content + "-" + link;
-    $(#msgbox).content(<MsgboxComponent width={width} height={height} auto_login={auto_login} type={type} title={title} content={content} link={link} remember={remember} callback={callback} contentStyle={contentStyle} hasRetry={hasRetry} />);
+    $(#msgbox).content(<MsgboxComponent width={width} height={height} autoLogin={autoLogin} type={type} title={title} content={content} link={link} remember={remember} callback={callback} contentStyle={contentStyle} hasRetry={hasRetry} />);
 }
 
 function connecting() {
@@ -306,7 +339,7 @@ handler.msgbox_retry = function(type, title, text, link, hasRetry) {
 function retryConnect(cancelTimer=false) {
     if (cancelTimer) self.timer(0, retryConnect);
     if (!is_port_forward) connecting();
-    handler.reconnect();
+    handler.reconnect(false);
 }
 /******************** end of msgbox ****************************************/
 
@@ -403,7 +436,7 @@ function httpRequest(url, type, params, _onSuccess, _onError, headers="") {
         if (status == " ") self.timer(0.1s, check_status);
         else {
             try {
-                var data = JSON.parse(status);
+                var data = JSON.parse(status || "{}");
                 _onSuccess(data);
             } catch (e) {
                 _onError(status, 0);
@@ -425,3 +458,24 @@ function awake() {
     view.focus = self;
 }
 
+class MultipleSessionComponent extends Reactor.Component {
+    this var sessions = [];
+    this var messageText = translate("Please select the session you want to connect to");
+
+    function this(params) {
+        if (params && params.sessions) {
+            this.sessions = params.sessions;
+        }
+    }
+
+    function render() {
+        return <div .user-session>
+            <div .title>{this.messageText}</div>
+            <select>
+                {this.sessions.map(session =>
+                    <option value={session.sid}>{session.name}</option>
+                )}
+            </select>
+        </div>;
+    }
+}

@@ -1,54 +1,54 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - Jouw verbinding op afstand"><br>
+  <img src="../res/logo-header.svg" alt="RustDesk - Uw bureaublad op afstand"><br>
   <a href="#free-public-servers">Servers</a> •
   <a href="#raw-steps-to-build">Bouwen</a> •
   <a href="#how-to-build-with-docker">Docker</a> •
   <a href="#file-structure">Structuur</a> •
   <a href="#snapshot">Snapshot</a><br>
   [<a href="../README.md">English</a>] | [<a href="README-UA.md">Українська</a>] | [<a href="README-CS.md">česky</a>] | [<a href="README-ZH.md">中文</a>] | [<a href="README-HU.md">Magyar</a>] | [<a href="README-ES.md">Español</a>] | [<a href="README-FA.md">فارسی</a>] | [<a href="README-FR.md">Français</a>] | [<a href="README-DE.md">Deutsch</a>] | [<a href="README-PL.md">Polski</a>] | [<a href="README-ID.md">Indonesian</a>] | [<a href="README-FI.md">Suomi</a>] | [<a href="README-ML.md">മലയാളം</a>] | [<a href="README-JP.md">日本語</a>] | [<a href="README-IT.md">Italiano</a>] | [<a href="README-RU.md">Русский</a>] | [<a href="README-PTBR.md">Português (Brasil)</a>] | [<a href="README-EO.md">Esperanto</a>] | [<a href="README-KR.md">한국어</a>] | [<a href="README-AR.md">العربي</a>] | [<a href="README-VN.md">Tiếng Việt</a>] | [<a href="README-GR.md">Ελληνικά</a>]<br>
-  <b>We hebben je hulp nodig om deze README te vertalen naar jouw moedertaal</b>
+  <b>Wij hebben uw hulp nodig om dit README bestand te vertalen, <a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">RustDesk UI</a> en <a href="https://github.com/rustdesk/doc.rustdesk.com">Doc</a> naar uw moedertaal</b>
 </p>
 
-Praat met ons: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk)
+Chat met ons: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk)
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/I2I04VU09)
 
-Nog weer een applicatie voor toegang op afstand, geschreven in Rust. Werkt meteen, geen configuratie nodig. Je hebt volledig beheer over je data, zonder na te hoeven denken over veiligheid. Je kunt onze rendez-vous/relay-server gebruiken, [je eigen server opzetten](https://rustdesk.com/blog/id-relay-set), of [je eigen rendez-vous/relay-server schrijven](https://github.com/rustdesk/rustdesk-server-demo).
+Alweer een andere programma voor -bureaublad op afstand-, geschreven in Rust. Werkt -out of the box-, geen configuratie nodig. U heeft volledige controle over uw gegevens, en hoeft zich geen zorgen te maken over de beveiliging. U kunt onze rendez-vous/relay server gebruiken, [je eigen server opzetten](https://rustdesk.com/blog/id-relay-set), of [je eigen rendez-vous/relay-server schrijven](https://github.com/rustdesk/rustdesk-server-demo).
 
-RustDesk verwelkomt bijdragen van iedereen. Zie [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) om te lezen hoe je van start kunt gaan.
+RustDesk verwelkomt bijdragen van iedereen. Zie [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) voor hulp om aan de slag te gaan.
+
+[**FAQ**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
 
 [**BINARY DOWNLOAD**](https://github.com/rustdesk/rustdesk/releases)
 
-## Gratis openbare servers
+[**NIGHTLY BUILD**](https://github.com/rustdesk/rustdesk/releases/tag/nightly) (meest recente build)
 
-Onderstaande servers zijn de servers die je gratis kunt gebruiken, ze kunnen op termijn veranderen. Als je niet fysiek dichtbij een van deze servers bent, kan je verbinding traag werken.
-| Locatie | Aanbieder | Specificaties |
-| --------- | ------------- | ------------------ |
-| Seoul | AWS lightsail | 1 vCPU / 0.5GB RAM |
-| Germany | Hetzner | 2 vCPU / 4GB RAM |
-| Germany | Codext | 4 vCPU / 8GB RAM |
-| Finland (Helsinki) | [Netlock](https://netlockendpoint.com) | 4 vCPU / 8GB RAM |
-| USA (Ashburn) | [Netlock](https://netlockendpoint.com) | 4 vCPU / 8GB RAM |
-| Ukraine (Kyiv) | [dc.volia](https://dc.volia.com) | 2 vCPU / 4GB RAM |
+[<img src="https://fdroid.gitlab.io/artwork/badge/get-it-on.png"
+    alt="Download het op F-Droid"
+    height="80">](https://f-droid.org/en/packages/com.carriez.flutter_hbb)
 
 ## Afhankelijkheden
 
-Desktopversies gebruiken [sciter](https://sciter.com/) voor de grafische schil. Gelieve zelf de sciter-library te downloaden.
+Desktop versies gebruiken [sciter](https://sciter.com/) of Flutter voor GUI, deze handleiding is alleen voor Sciter.
+
+Download zelf de dynamic library van Sciter.
 
 [Windows](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.win/x64/sciter.dll) |
 [Linux](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so) |
 [MacOS](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.osx/libsciter.dylib)
 
-## Handmatige bouwinstructies
+## Ruwe stappen om te bouwen
 
 - Bereid je Rust-ontwikkelomgeving en C++-bouwomgeving voor.
 
 - Installeer [vcpkg](https://github.com/microsoft/vcpkg) en configureer de `VCPKG_ROOT` omgevingsvariabele op de juiste manier:
 
-  - Windows: vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static
-  - Linux/MacOS: vcpkg install libvpx libyuv opus
+  - Windows: vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static
+  - Linux/MacOS: vcpkg install libvpx libyuv opus aom
 
 - Voer uit: `cargo run`
+
+## [Bouwen](https://rustdesk.com/docs/en/dev/build/)
 
 ## Bouwen op Linux
 
@@ -56,6 +56,12 @@ Desktopversies gebruiken [sciter](https://sciter.com/) voor de grafische schil. 
 
 ```sh
 sudo apt install -y g++ gcc git curl wget nasm yasm libgtk-3-dev clang libxcb-randr0-dev libxdo-dev libxfixes-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libpulse-dev cmake
+```
+
+### openSUSE Tumbleweed 
+
+```sh
+sudo zypper install gcc-c++ git curl wget nasm yasm gcc gtk3-devel clang libxcb-devel libXfixes-devel cmake alsa-lib-devel gstreamer-devel gstreamer-plugins-base-devel xdotool-devel
 ```
 
 ### Fedora 28 (CentOS 8)
@@ -75,11 +81,11 @@ sudo pacman -Syu --needed unzip git cmake gcc curl wget yasm nasm zip make pkg-c
 ```sh
 git clone https://github.com/microsoft/vcpkg
 cd vcpkg
-git checkout 2021.12.01
+git checkout 2023.04.15
 cd ..
 vcpkg/bootstrap-vcpkg.sh
 export VCPKG_ROOT=$HOME/vcpkg
-vcpkg/vcpkg install libvpx libyuv opus
+vcpkg/vcpkg install libvpx libyuv opus aom
 ```
 
 ### Fix voor libvpx (voor Fedora)
@@ -108,13 +114,9 @@ mv libsciter-gtk.so target/debug
 VCPKG_ROOT=$HOME/vcpkg cargo run
 ```
 
-### Wissel van Wayland naar X11 (Xorg)
-
-RustDesk ondersteunt Wayland niet. Lees [hier](https://docs.fedoraproject.org/en-US/quick-docs/configuring-xorg-as-default-gnome-session/) hoe je Xorg als standaardsessie kunt instellen voor GNOME.
-
 ## Bouwen met Docker
 
-Kloon eerst deze repository en bouw de Docker-container:
+Begin met het klonen van de repository en het bouwen van de docker container:
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
@@ -122,7 +124,7 @@ cd rustdesk
 docker build -t "rustdesk-builder" .
 ```
 
-Voer vervolgens de volgende commando's uit iedere keer dat je de applicatie opnieuw moet bouwen:
+Elke keer dat u de toepassing moet bouwen, voert u het volgende commando uit:
 
 ```sh
 docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
@@ -130,7 +132,7 @@ docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user
 
 Let op dat de eerste build langer kan duren omdat de dependencies nog niet zijn gecached; latere builds zullen sneller zijn. Als je extra command line arguments wilt toevoegen aan het build-commando, dan kun je dat doen aan het einde van de opdrachtregel in plaats van `<OPTIONAL-ARGS>`. Bijvoorbeeld: als je een geoptimaliseerde releaseversie wilt bouwen, draai dan het bovenstaande commando gevolgd door `--release`.
 
-Het uitvoerbare bestand, in debug-modus, zal verschijnen in de target-map, en kan als volgt worden uitgevoerd:
+ Het uitvoerbare bestand, in debug-modus, zal verschijnen in de target-map, en kan als volgt worden uitgevoerd:
 
 ```sh
 target/debug/rustdesk

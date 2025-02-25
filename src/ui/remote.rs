@@ -20,7 +20,6 @@ use hbb_common::{
 
 use crate::{
     client::*,
-    ui_interface::has_hwcodec,
     ui_session_interface::{InvokeUiSession, Session},
 };
 
@@ -66,6 +65,39 @@ impl SciterHandler {
             displays_value.push(display);
         }
         displays_value
+    }
+
+    fn make_platform_additions(data: &str) -> Option<Value> {
+        if let Ok(v2) = serde_json::from_str::<HashMap<String, serde_json::Value>>(data) {
+            let mut value = Value::map();
+            for (k, v) in v2 {
+                match v {
+                    serde_json::Value::String(s) => {
+                        value.set_item(k, s);
+                    }
+                    serde_json::Value::Number(n) => {
+                        if let Some(n) = n.as_i64() {
+                            value.set_item(k, n as i32);
+                        } else if let Some(n) = n.as_f64() {
+                            value.set_item(k, n);
+                        }
+                    }
+                    serde_json::Value::Bool(b) => {
+                        value.set_item(k, b);
+                    }
+                    _ => {
+                        // ignore for now
+                    }
+                }
+            }
+            if value.len() > 0 {
+                return Some(value);
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 }
 
@@ -123,12 +155,17 @@ impl InvokeUiSession for SciterHandler {
             "updateQualityStatus",
             &make_args!(
                 status.speed.map_or(Value::null(), |it| it.into()),
-                status.fps.map_or(Value::null(), |it| it.into()),
+                status
+                    .fps
+                    .iter()
+                    .next()
+                    .map_or(Value::null(), |(_, v)| (*v).into()),
                 status.delay.map_or(Value::null(), |it| it.into()),
                 status.target_bitrate.map_or(Value::null(), |it| it.into()),
                 status
                     .codec_format
-                    .map_or(Value::null(), |it| it.to_string().into())
+                    .map_or(Value::null(), |it| it.to_string().into()),
+                status.chroma.map_or(Value::null(), |it| it.into())
             ),
         );
     }
@@ -144,6 +181,8 @@ impl InvokeUiSession for SciterHandler {
     fn set_connection_type(&self, is_secured: bool, direct: bool) {
         self.call("setConnectionType", &make_args!(is_secured, direct));
     }
+
+    fn set_fingerprint(&self, _fingerprint: String) {}
 
     fn job_error(&self, id: i32, err: String, file_num: i32) {
         self.call("jobError", &make_args!(id, err, file_num));
@@ -197,7 +236,14 @@ impl InvokeUiSession for SciterHandler {
         self.call("confirmDeleteFiles", &make_args!(id, i, name));
     }
 
-    fn override_file_confirm(&self, id: i32, file_num: i32, to: String, is_upload: bool, is_identical: bool) {
+    fn override_file_confirm(
+        &self,
+        id: i32,
+        file_num: i32,
+        to: String,
+        is_upload: bool,
+        is_identical: bool,
+    ) {
         self.call(
             "overrideFileConfirm",
             &make_args!(id, file_num, to, is_upload, is_identical),
@@ -215,12 +261,12 @@ impl InvokeUiSession for SciterHandler {
         self.call("adaptSize", &make_args!());
     }
 
-    fn on_rgba(&self, data: &mut Vec<u8>) {
+    fn on_rgba(&self, _display: usize, rgba: &mut scrap::ImageRgb) {
         VIDEO
             .lock()
             .unwrap()
             .as_mut()
-            .map(|v| v.render_frame(data).ok());
+            .map(|v| v.render_frame(&rgba.raw).ok());
     }
 
     fn set_peer_info(&self, pi: &PeerInfo) {
@@ -231,6 +277,10 @@ impl InvokeUiSession for SciterHandler {
         pi_sciter.set_item("sas_enabled", pi.sas_enabled);
         pi_sciter.set_item("displays", Self::make_displays_array(&pi.displays));
         pi_sciter.set_item("current_display", pi.current_display);
+        pi_sciter.set_item("version", pi.version.clone());
+        if let Some(v) = Self::make_platform_additions(&pi.platform_additions) {
+            pi_sciter.set_item("platform_additions", v);
+        }
         self.call("updatePi", &make_args!(pi_sciter));
     }
 
@@ -241,6 +291,26 @@ impl InvokeUiSession for SciterHandler {
         );
     }
 
+    fn set_platform_additions(&self, _data: &str) {
+        // Ignore for sciter version.
+    }
+
+    fn set_current_display(&self, _disp_idx: i32) {
+        self.call("setCurrentDisplay", &make_args!(_disp_idx));
+    }
+
+    fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>) {
+        let mut v = Value::array(0);
+        let mut sessions = sessions;
+        for s in sessions.drain(..) {
+            let mut obj = Value::map();
+            obj.set_item("sid", s.sid.to_string());
+            obj.set_item("name", s.name);
+            v.push(obj);
+        }
+        self.call("setMultipleWindowsSession", &make_args!(v));
+    }
+
     fn on_connected(&self, conn_type: ConnType) {
         match conn_type {
             ConnType::RDP => {}
@@ -249,6 +319,9 @@ impl InvokeUiSession for SciterHandler {
             ConnType::DEFAULT_CONN => {
                 crate::keyboard::client::start_grab_loop();
             }
+            // Left empty code from compilation.
+            // Please replace the code in the PR.
+            ConnType::VIEW_CAMERA => {}
         }
     }
 
@@ -296,11 +369,15 @@ impl InvokeUiSession for SciterHandler {
     }
 
     /// RGBA is directly rendered by [on_rgba]. No need to store the rgba for the sciter ui.
-    fn get_rgba(&self) -> *const u8 {
+    fn get_rgba(&self, _display: usize) -> *const u8 {
         std::ptr::null()
     }
 
-    fn next_rgba(&self) {}
+    fn next_rgba(&self, _display: usize) {}
+
+    fn update_record_status(&self, start: bool) {
+        self.call("updateRecordStatus", &make_args!(start));
+    }
 }
 
 pub struct SciterSession(Session<SciterHandler>);
@@ -369,7 +446,7 @@ impl sciter::EventHandler for SciterSession {
                 let source = Element::from(source);
                 use sciter::dom::ELEMENT_AREAS;
                 let flags = ELEMENT_AREAS::CONTENT_BOX as u32 | ELEMENT_AREAS::SELF_RELATIVE as u32;
-                let rc = source.get_location(flags).unwrap();
+                let rc = source.get_location(flags).unwrap_or_default();
                 log::debug!(
                     "[video] start video thread on <{}> which is about {:?} pixels",
                     source,
@@ -398,11 +475,13 @@ impl sciter::EventHandler for SciterSession {
         fn is_file_transfer();
         fn is_port_forward();
         fn is_rdp();
-        fn login(String, bool);
+        fn login(String, String, String, bool);
+        fn send2fa(String, bool);
+        fn get_enable_trusted_devices();
         fn new_rdp();
         fn send_mouse(i32, i32, i32, bool, bool, bool, bool);
-        fn enter();
-        fn leave();
+        fn enter(String);
+        fn leave(String);
         fn ctrl_alt_del();
         fn transfer_file();
         fn tunnel();
@@ -441,8 +520,8 @@ impl sciter::EventHandler for SciterSession {
         fn save_view_style(String);
         fn save_image_quality(String);
         fn save_custom_image_quality(i32);
-        fn refresh_video();
-        fn record_screen(bool, i32, i32);
+        fn refresh_video(i32);
+        fn record_screen(bool);
         fn get_toggle_option(String);
         fn is_privacy_mode_supported();
         fn toggle_option(String);
@@ -450,13 +529,17 @@ impl sciter::EventHandler for SciterSession {
         fn peer_platform();
         fn set_write_override(i32, i32, bool, bool, bool);
         fn get_keyboard_mode();
+        fn is_keyboard_mode_supported(String);
         fn save_keyboard_mode(String);
-        fn has_hwcodec();
-        fn supported_hwcodec();
+        fn alternative_codecs();
         fn change_prefer_codec();
         fn restart_remote_device();
         fn request_voice_call();
         fn close_voice_call();
+        fn version_cmp(String, String);
+        fn set_selected_windows_session_id(String);
+        fn is_recording();
+        fn has_file_clipboard();
     }
 }
 
@@ -464,7 +547,6 @@ impl SciterSession {
     pub fn new(cmd: String, id: String, password: String, args: Vec<String>) -> Self {
         let force_relay = args.contains(&"--relay".to_string());
         let session: Session<SciterHandler> = Session {
-            id: id.clone(),
             password: password.clone(),
             args,
             server_keyboard_enabled: Arc::new(RwLock::new(true)),
@@ -487,7 +569,7 @@ impl SciterSession {
             .lc
             .write()
             .unwrap()
-            .initialize(id, conn_type, None, force_relay);
+            .initialize(id, conn_type, None, force_relay, None, None, None);
 
         Self(session)
     }
@@ -504,10 +586,6 @@ impl SciterSession {
         v
     }
 
-    fn has_hwcodec(&self) -> bool {
-        has_hwcodec()
-    }
-
     pub fn t(&self, name: String) -> String {
         crate::client::translate(name)
     }
@@ -516,9 +594,11 @@ impl SciterSession {
         super::get_icon()
     }
 
-    fn supported_hwcodec(&self) -> Value {
-        let (h264, h265) = self.0.supported_hwcodec();
+    fn alternative_codecs(&self) -> Value {
+        let (vp8, av1, h264, h265) = self.0.alternative_codecs();
         let mut v = Value::array(0);
+        v.push(vp8);
+        v.push(av1);
         v.push(h264);
         v.push(h265);
         v
@@ -561,6 +641,14 @@ impl SciterSession {
         }
         self.save_config(config);
         log::info!("size saved");
+    }
+
+    fn set_selected_windows_session_id(&mut self, u_sid: String) {
+        self.send_selected_session_id(u_sid);
+    }
+
+    fn has_file_clipboard(&self) -> bool {
+        cfg!(any(target_os = "windows", feature = "unix-file-copy-paste"))
     }
 
     fn get_port_forwards(&mut self) -> Value {
@@ -746,6 +834,10 @@ impl SciterSession {
         if let Err(err) = crate::run_me(args) {
             log::error!("Failed to spawn IP tunneling: {}", err);
         }
+    }
+
+    fn version_cmp(&self, v1: String, v2: String) -> i32 {
+        (hbb_common::get_version_number(&v1) - hbb_common::get_version_number(&v2)) as i32
     }
 }
 

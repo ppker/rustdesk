@@ -115,7 +115,7 @@ impl Enigo {
 
 impl Default for Enigo {
     fn default() -> Self {
-        let is_x11 = "x11" == hbb_common::platform::linux::get_display_server();
+        let is_x11 = hbb_common::platform::linux::is_x11_or_headless();
         Self {
             is_x11,
             tfc: if is_x11 {
@@ -345,7 +345,7 @@ fn convert_to_tfc_key(key: Key) -> Option<TFC_Key> {
         Key::Numpad9 => TFC_Key::N9,
         Key::Decimal => TFC_Key::NumpadDecimal,
         Key::Clear => TFC_Key::NumpadClear,
-        Key::Pause => TFC_Key::PlayPause,
+        Key::Pause => TFC_Key::Pause,
         Key::Print => TFC_Key::Print,
         Key::Snapshot => TFC_Key::PrintScreen,
         Key::Insert => TFC_Key::Insert,

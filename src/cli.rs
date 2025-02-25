@@ -1,4 +1,5 @@
 use crate::client::*;
+use async_trait::async_trait;
 use hbb_common::{
     config::PeerConfig,
     config::READ_TIMEOUT,
@@ -32,11 +33,14 @@ impl Session {
             password,
             lc: Default::default(),
         };
-        session
-            .lc
-            .write()
-            .unwrap()
-            .initialize(id.to_owned(), ConnType::PORT_FORWARD, None);
+        session.lc.write().unwrap().initialize(
+            id.to_owned(),
+            ConnType::PORT_FORWARD,
+            None,
+            false,
+            None,
+            None,
+        );
         session
     }
 }
@@ -48,30 +52,42 @@ impl Interface for Session {
     }
 
     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str) {
-        if msgtype == "input-password" {
-            self.sender
-                .send(Data::Login((self.password.clone(), true)))
-                .ok();
-        } else if msgtype == "re-input-password" {
-            log::error!("{}: {}", title, text);
-            let pass = rpassword::prompt_password("Enter password: ").unwrap();
-            self.sender.send(Data::Login((pass, true))).ok();
-        } else if msgtype.contains("error") {
-            log::error!("{}: {}: {}", msgtype, title, text);
-        } else {
-            log::info!("{}: {}: {}", msgtype, title, text);
+        match msgtype {
+            "input-password" => {
+                self.sender
+                    .send(Data::Login((self.password.clone(), true)))
+                    .ok();
+            }
+            "re-input-password" => {
+                log::error!("{}: {}", title, text);
+                match rpassword::prompt_password("Enter password: ") {
+                    Ok(password) => {
+                        let login_data = Data::Login((password, true));
+                        self.sender.send(login_data).ok();
+                    }
+                    Err(e) => {
+                        log::error!("reinput password failed, {:?}", e);
+                    }
+                }
+            }
+            msg if msg.contains("error") => {
+                log::error!("{}: {}: {}", msgtype, title, text);
+            }
+            _ => {
+                log::info!("{}: {}: {}", msgtype, title, text);
+            }
         }
     }
 
-    fn handle_login_error(&mut self, err: &str) -> bool {
+    fn handle_login_error(&self, err: &str) -> bool {
         handle_login_error(self.lc.clone(), err, self)
     }
 
-    fn handle_peer_info(&mut self, pi: PeerInfo) {
+    fn handle_peer_info(&self, pi: PeerInfo) {
         self.lc.write().unwrap().handle_peer_info(&pi);
     }
 
-    async fn handle_hash(&mut self, pass: &str, hash: Hash, peer: &mut Stream) {
+    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream) {
         log::info!(
             "password={}",
             hbb_common::password_security::temporary_password()
@@ -79,11 +95,26 @@ impl Interface for Session {
         handle_hash(self.lc.clone(), &pass, hash, self, peer).await;
     }
 
-    async fn handle_login_from_ui(&mut self, password: String, remember: bool, peer: &mut Stream) {
-        handle_login_from_ui(self.lc.clone(), password, remember, peer).await;
+    async fn handle_login_from_ui(
+        &self,
+        os_username: String,
+        os_password: String,
+        password: String,
+        remember: bool,
+        peer: &mut Stream,
+    ) {
+        handle_login_from_ui(
+            self.lc.clone(),
+            os_username,
+            os_password,
+            password,
+            remember,
+            peer,
+        )
+        .await;
     }
 
-    async fn handle_test_delay(&mut self, t: TestDelay, peer: &mut Stream) {
+    async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {
         handle_test_delay(t, peer).await;
     }
 
@@ -111,13 +142,14 @@ pub async fn connect_test(id: &str, key: String, token: String) {
                             break;
                         }
                         Ok(Some(Ok(bytes))) => {
-                            let msg_in = Message::parse_from_bytes(&bytes).unwrap();
-                            match msg_in.union {
-                                Some(message::Union::Hash(hash)) => {
-                                    log::info!("Got hash");
-                                    break;
+                            if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
+                                match msg_in.union {
+                                    Some(message::Union::Hash(hash)) => {
+                                        log::info!("Got hash");
+                                        break;
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
                         _ => {}

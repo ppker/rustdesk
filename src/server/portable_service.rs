@@ -8,12 +8,14 @@ use hbb_common::{
     tokio::{self, sync::mpsc},
     ResultType,
 };
-use scrap::{Capturer, Frame, TraitCapturer};
+#[cfg(feature = "vram")]
+use scrap::AdapterDevice;
+use scrap::{Capturer, Frame, TraitCapturer, TraitPixelBuffer};
 use shared_memory::*;
 use std::{
     mem::size_of,
     ops::{Deref, DerefMut},
-    path::PathBuf,
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -25,7 +27,6 @@ use winapi::{
 use crate::{
     ipc::{self, new_listener, Connection, Data, DataPortableService},
     platform::set_path_permission,
-    video_service::get_current_display,
 };
 
 use super::video_qos;
@@ -37,8 +38,8 @@ const ADDR_CURSOR_PARA: usize = 0;
 const ADDR_CURSOR_COUNTER: usize = ADDR_CURSOR_PARA + size_of::<CURSORINFO>();
 
 const ADDR_CAPTURER_PARA: usize = ADDR_CURSOR_COUNTER + SIZE_COUNTER;
-const ADDR_CAPTURE_FRAME_SIZE: usize = ADDR_CAPTURER_PARA + size_of::<CapturerPara>();
-const ADDR_CAPTURE_WOULDBLOCK: usize = ADDR_CAPTURE_FRAME_SIZE + size_of::<i32>();
+const ADDR_CAPTURE_FRAME_INFO: usize = ADDR_CAPTURER_PARA + size_of::<CapturerPara>();
+const ADDR_CAPTURE_WOULDBLOCK: usize = ADDR_CAPTURE_FRAME_INFO + size_of::<FrameInfo>();
 const ADDR_CAPTURE_FRAME_COUNTER: usize = ADDR_CAPTURE_WOULDBLOCK + size_of::<i32>();
 
 const ADDR_CAPTURE_FRAME: usize =
@@ -90,8 +91,8 @@ impl SharedMemory {
                 bail!("Unable to create shmem flink {} : {}", flink, e);
             }
         };
-        log::info!("Create shared memory, size:{}, flink:{}", size, flink);
-        set_path_permission(&PathBuf::from(flink), "F").ok();
+        log::info!("Create shared memory, size: {}, flink: {}", size, flink);
+        set_path_permission(Path::new(&flink), "F").ok();
         Ok(SharedMemory { inner: shmem })
     }
 
@@ -103,13 +104,13 @@ impl SharedMemory {
                 bail!("Unable to open existing shmem flink {} : {}", flink, e);
             }
         };
-        log::info!("open existing shared memory, flink:{:?}", flink);
+        log::info!("open existing shared memory, flink: {:?}", flink);
         Ok(SharedMemory { inner: shmem })
     }
 
     pub fn write(&self, addr: usize, data: &[u8]) {
         unsafe {
-            assert!(addr + data.len() <= self.inner.len());
+            debug_assert!(addr + data.len() <= self.inner.len());
             let ptr = self.inner.as_ptr().add(addr);
             let shared_mem_slice = slice::from_raw_parts_mut(ptr, data.len());
             shared_mem_slice.copy_from_slice(data);
@@ -134,10 +135,16 @@ mod utils {
     use core::slice;
     use std::mem::size_of;
 
+    use super::{
+        CapturerPara, FrameInfo, SharedMemory, ADDR_CAPTURER_PARA, ADDR_CAPTURE_FRAME_INFO,
+    };
+
+    #[inline]
     pub fn i32_to_vec(i: i32) -> Vec<u8> {
         i.to_ne_bytes().to_vec()
     }
 
+    #[inline]
     pub fn ptr_to_i32(ptr: *const u8) -> i32 {
         unsafe {
             let v = slice::from_raw_parts(ptr, size_of::<i32>());
@@ -145,6 +152,7 @@ mod utils {
         }
     }
 
+    #[inline]
     pub fn counter_ready(counter: *const u8) -> bool {
         unsafe {
             let wptr = counter;
@@ -160,6 +168,7 @@ mod utils {
         }
     }
 
+    #[inline]
     pub fn counter_equal(counter: *const u8) -> bool {
         unsafe {
             let wptr = counter;
@@ -170,28 +179,55 @@ mod utils {
         }
     }
 
+    #[inline]
     pub fn increase_counter(counter: *mut u8) {
         unsafe {
             let wptr = counter;
             let rptr = counter.add(size_of::<i32>());
             let iw = ptr_to_i32(counter);
             let ir = ptr_to_i32(counter);
-            let v = i32_to_vec(iw + 1);
+            let iw_plus1 = if iw == i32::MAX { 0 } else { iw + 1 };
+            let v = i32_to_vec(iw_plus1);
             std::ptr::copy_nonoverlapping(v.as_ptr(), wptr, size_of::<i32>());
-            if ir == iw + 1 {
+            if ir == iw_plus1 {
                 let v = i32_to_vec(iw);
                 std::ptr::copy_nonoverlapping(v.as_ptr(), rptr, size_of::<i32>());
             }
         }
     }
 
+    #[inline]
     pub fn align(v: usize, align: usize) -> usize {
         (v + align - 1) / align * align
+    }
+
+    #[inline]
+    pub fn set_para(shmem: &SharedMemory, para: CapturerPara) {
+        let para_ptr = &para as *const CapturerPara as *const u8;
+        let para_data;
+        unsafe {
+            para_data = slice::from_raw_parts(para_ptr, size_of::<CapturerPara>());
+        }
+        shmem.write(ADDR_CAPTURER_PARA, para_data);
+    }
+
+    #[inline]
+    pub fn set_frame_info(shmem: &SharedMemory, info: FrameInfo) {
+        let ptr = &info as *const FrameInfo as *const u8;
+        let data;
+        unsafe {
+            data = slice::from_raw_parts(ptr, size_of::<FrameInfo>());
+        }
+        shmem.write(ADDR_CAPTURE_FRAME_INFO, data);
     }
 }
 
 // functions called in separate SYSTEM user process.
 pub mod server {
+    use hbb_common::message_proto::PointerDeviceEvent;
+
+    use crate::display_service;
+
     use super::*;
 
     lazy_static::lazy_static! {
@@ -199,7 +235,13 @@ pub mod server {
     }
 
     pub fn run_portable_service() {
-        let shmem = Arc::new(SharedMemory::open_existing(SHMEM_NAME).unwrap());
+        let shmem = match SharedMemory::open_existing(SHMEM_NAME) {
+            Ok(shmem) => Arc::new(shmem),
+            Err(e) => {
+                log::error!("Failed to open existing shared memory: {:?}", e);
+                return;
+            }
+        };
         let shmem1 = shmem.clone();
         let shmem2 = shmem.clone();
         let mut threads = vec![];
@@ -215,9 +257,18 @@ pub mod server {
         threads.push(std::thread::spawn(|| {
             run_exit_check();
         }));
+        let record_pos_handle = crate::input_service::try_start_record_cursor_pos();
         for th in threads.drain(..) {
-            th.join().unwrap();
+            th.join().ok();
             log::info!("thread joined");
+        }
+
+        crate::input_service::try_stop_record_cursor_pos();
+        if let Some(handle) = record_pos_handle {
+            match handle.join() {
+                Ok(_) => log::info!("record_pos_handle joined"),
+                Err(e) => log::error!("record_pos_handle join error {:?}", &e),
+            }
         }
     }
 
@@ -252,11 +303,12 @@ pub mod server {
     fn run_capture(shmem: Arc<SharedMemory>) {
         let mut c = None;
         let mut last_current_display = usize::MAX;
-        let mut last_use_yuv = false;
         let mut last_timeout_ms: i32 = 33;
         let mut spf = Duration::from_millis(last_timeout_ms as _);
         let mut first_frame_captured = false;
         let mut dxgi_failed_times = 0;
+        let mut display_width = 0;
+        let mut display_height = 0;
         loop {
             if EXIT.lock().unwrap().clone() {
                 break;
@@ -264,45 +316,55 @@ pub mod server {
             unsafe {
                 let para_ptr = shmem.as_ptr().add(ADDR_CAPTURER_PARA);
                 let para = para_ptr as *const CapturerPara;
+                let recreate = (*para).recreate;
                 let current_display = (*para).current_display;
-                let use_yuv = (*para).use_yuv;
-                let use_yuv_set = (*para).use_yuv_set;
                 let timeout_ms = (*para).timeout_ms;
-                if !use_yuv_set {
-                    c = None;
-                    std::thread::sleep(spf);
-                    continue;
-                }
                 if c.is_none() {
-                    *crate::video_service::CURRENT_DISPLAY.lock().unwrap() = current_display;
-                    let (_, _current, display) = get_current_display().unwrap();
-                    match Capturer::new(display, use_yuv) {
+                    let Ok(mut displays) = display_service::try_get_displays() else {
+                        log::error!("Failed to get displays");
+                        *EXIT.lock().unwrap() = true;
+                        return;
+                    };
+                    if displays.len() <= current_display {
+                        log::error!("Invalid display index:{}", current_display);
+                        *EXIT.lock().unwrap() = true;
+                        return;
+                    }
+                    let display = displays.remove(current_display);
+                    display_width = display.width();
+                    display_height = display.height();
+                    match Capturer::new(display) {
                         Ok(mut v) => {
                             c = {
                                 last_current_display = current_display;
-                                last_use_yuv = use_yuv;
                                 first_frame_captured = false;
                                 if dxgi_failed_times > MAX_DXGI_FAIL_TIME {
                                     dxgi_failed_times = 0;
                                     v.set_gdi();
                                 }
+                                utils::set_para(
+                                    &shmem,
+                                    CapturerPara {
+                                        recreate: false,
+                                        current_display: (*para).current_display,
+                                        timeout_ms: (*para).timeout_ms,
+                                    },
+                                );
                                 Some(v)
                             }
                         }
                         Err(e) => {
-                            log::error!("Failed to create gdi capturer:{:?}", e);
+                            log::error!("Failed to create gdi capturer: {:?}", e);
                             std::thread::sleep(std::time::Duration::from_secs(1));
                             continue;
                         }
                     }
                 } else {
-                    if current_display != last_current_display || use_yuv != last_use_yuv {
+                    if recreate || current_display != last_current_display {
                         log::info!(
-                            "display:{}->{}, use_yuv:{}->{}",
+                            "create capturer, display: {} -> {}",
                             last_current_display,
                             current_display,
-                            last_use_yuv,
-                            use_yuv
                         );
                         c = None;
                         continue;
@@ -317,32 +379,43 @@ pub mod server {
                 }
                 if first_frame_captured {
                     if !utils::counter_equal(shmem.as_ptr().add(ADDR_CAPTURE_FRAME_COUNTER)) {
-                        std::thread::sleep(spf);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
                 }
-                match c.as_mut().unwrap().frame(spf) {
-                    Ok(f) => {
-                        let len = f.0.len();
-                        let len_slice = utils::i32_to_vec(len as _);
-                        shmem.write(ADDR_CAPTURE_FRAME_SIZE, &len_slice);
-                        shmem.write(ADDR_CAPTURE_FRAME, f.0);
-                        shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(TRUE));
-                        utils::increase_counter(shmem.as_ptr().add(ADDR_CAPTURE_FRAME_COUNTER));
-                        first_frame_captured = true;
-                        dxgi_failed_times = 0;
-                    }
-                    Err(e) => {
+                match c.as_mut().map(|f| f.frame(spf)) {
+                    Some(Ok(f)) => match f {
+                        Frame::PixelBuffer(f) => {
+                            utils::set_frame_info(
+                                &shmem,
+                                FrameInfo {
+                                    length: f.data().len(),
+                                    width: display_width,
+                                    height: display_height,
+                                },
+                            );
+                            shmem.write(ADDR_CAPTURE_FRAME, f.data());
+                            shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(TRUE));
+                            utils::increase_counter(shmem.as_ptr().add(ADDR_CAPTURE_FRAME_COUNTER));
+                            first_frame_captured = true;
+                            dxgi_failed_times = 0;
+                        }
+                        Frame::Texture(_) => {
+                            // should not happen
+                        }
+                    },
+                    Some(Err(e)) => {
+                        if crate::platform::windows::desktop_changed() {
+                            crate::platform::try_change_desktop();
+                            c = None;
+                            std::thread::sleep(spf);
+                            continue;
+                        }
                         if e.kind() != std::io::ErrorKind::WouldBlock {
                             // DXGI_ERROR_INVALID_CALL after each success on Microsoft GPU driver
-                            // log::error!("capture frame failed:{:?}", e);
-                            if crate::platform::windows::desktop_changed() {
-                                crate::platform::try_change_desktop();
-                                c = None;
-                                std::thread::sleep(spf);
-                                continue;
-                            }
-                            if !c.as_ref().unwrap().is_gdi() {
+                            // log::error!("capture frame failed: {:?}", e);
+                            if c.as_ref().map(|c| c.is_gdi()) == Some(false) {
+                                // nog gdi
                                 dxgi_failed_times += 1;
                             }
                             if dxgi_failed_times > MAX_DXGI_FAIL_TIME {
@@ -353,6 +426,9 @@ pub mod server {
                         } else {
                             shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(TRUE));
                         }
+                    }
+                    _ => {
+                        println!("unreachable!");
                     }
                 }
             }
@@ -367,7 +443,8 @@ pub mod server {
 
         match ipc::connect(1000, postfix).await {
             Ok(mut stream) => {
-                let mut timer = tokio::time::interval(Duration::from_secs(1));
+                let mut timer =
+                    crate::rustdesk_interval(tokio::time::interval(Duration::from_secs(1)));
                 let mut nack = 0;
                 loop {
                     tokio::select! {
@@ -399,9 +476,14 @@ pub mod server {
                                             break;
                                         }
                                     }
-                                    Mouse(v) => {
+                                    Mouse((v, conn)) => {
                                         if let Ok(evt) = MouseEvent::parse_from_bytes(&v) {
-                                            crate::input_service::handle_mouse_(&evt);
+                                            crate::input_service::handle_mouse_(&evt, conn);
+                                        }
+                                    }
+                                    Pointer((v, conn)) => {
+                                        if let Ok(evt) = PointerDeviceEvent::parse_from_bytes(&v) {
+                                            crate::input_service::handle_pointer_(&evt, conn);
                                         }
                                     }
                                     Key(v) => {
@@ -427,7 +509,7 @@ pub mod server {
                 }
             }
             Err(e) => {
-                log::error!("Failed to connect portable service ipc:{:?}", e);
+                log::error!("Failed to connect portable service ipc: {:?}", e);
             }
         }
 
@@ -437,9 +519,10 @@ pub mod server {
 
 // functions called in main process.
 pub mod client {
-    use hbb_common::anyhow::Context;
-
     use super::*;
+    use crate::display_service;
+    use hbb_common::{anyhow::Context, message_proto::PointerDeviceEvent};
+    use scrap::PixelBuffer;
 
     lazy_static::lazy_static! {
         static ref RUNNING: Arc<Mutex<bool>> = Default::default();
@@ -466,9 +549,13 @@ pub mod client {
             let mut max_pixel = 0;
             let align = 64;
             for d in displays {
-                let pixel = utils::align(d.width(), align) * utils::align(d.height(), align);
-                if max_pixel < pixel {
-                    max_pixel = pixel;
+                let resolutions = crate::platform::resolutions(&d.name());
+                for r in resolutions {
+                    let pixel =
+                        utils::align(r.width as _, align) * utils::align(r.height as _, align);
+                    if max_pixel < pixel {
+                        max_pixel = pixel;
+                    }
                 }
             }
             let shmem_size = utils::align(ADDR_CAPTURE_FRAME + max_pixel * 4, align);
@@ -479,12 +566,11 @@ pub mod client {
             )?);
             shutdown_hooks::add_shutdown_hook(drop_portable_service_shared_memory);
         }
-        let mut option = SHMEM.lock().unwrap();
-        let shmem = option.as_mut().unwrap();
-        unsafe {
-            libc::memset(shmem.as_ptr() as _, 0, shmem.len() as _);
+        if let Some(shmem) = SHMEM.lock().unwrap().as_mut() {
+            unsafe {
+                libc::memset(shmem.as_ptr() as _, 0, shmem.len() as _);
+            }
         }
-        drop(option);
         match para {
             StartPara::Direct => {
                 if let Err(e) = crate::platform::run_background(
@@ -500,8 +586,8 @@ pub mod client {
                 let mut exe = std::env::current_exe()?.to_string_lossy().to_string();
                 #[cfg(feature = "flutter")]
                 {
-                    if let Some(dir) = PathBuf::from(&exe).parent() {
-                        if set_path_permission(&PathBuf::from(dir), "RX").is_err() {
+                    if let Some(dir) = Path::new(&exe).parent() {
+                        if set_path_permission(Path::new(dir), "RX").is_err() {
                             *SHMEM.lock().unwrap() = None;
                             bail!("Failed to set permission of {:?}", dir);
                         }
@@ -544,89 +630,98 @@ pub mod client {
     }
 
     pub extern "C" fn drop_portable_service_shared_memory() {
-        log::info!("drop shared memory");
-        *SHMEM.lock().unwrap() = None;
+        // https://stackoverflow.com/questions/35980148/why-does-an-atexit-handler-panic-when-it-accesses-stdout
+        // Please make sure there is no print in the call stack
+        let mut lock = SHMEM.lock().unwrap();
+        if lock.is_some() {
+            *lock = None;
+        }
     }
 
     pub fn set_quick_support(v: bool) {
         *QUICK_SUPPORT.lock().unwrap() = v;
     }
 
-    pub struct CapturerPortable;
+    pub struct CapturerPortable {
+        width: usize,
+        height: usize,
+    }
 
     impl CapturerPortable {
-        pub fn new(current_display: usize, use_yuv: bool) -> Self
+        pub fn new(current_display: usize) -> Self
         where
             Self: Sized,
         {
             let mut option = SHMEM.lock().unwrap();
-            let shmem = option.as_mut().unwrap();
-            Self::set_para(
-                shmem,
-                CapturerPara {
-                    current_display,
-                    use_yuv,
-                    use_yuv_set: false,
-                    timeout_ms: 33,
-                },
-            );
-            shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(TRUE));
-            CapturerPortable {}
-        }
-
-        fn set_para(shmem: &mut SharedMemory, para: CapturerPara) {
-            let para_ptr = &para as *const CapturerPara as *const u8;
-            let para_data;
-            unsafe {
-                para_data = slice::from_raw_parts(para_ptr, size_of::<CapturerPara>());
+            if let Some(shmem) = option.as_mut() {
+                unsafe {
+                    libc::memset(shmem.as_ptr() as _, 0, shmem.len() as _);
+                }
+                utils::set_para(
+                    shmem,
+                    CapturerPara {
+                        recreate: true,
+                        current_display,
+                        timeout_ms: 33,
+                    },
+                );
+                shmem.write(ADDR_CAPTURE_WOULDBLOCK, &utils::i32_to_vec(TRUE));
             }
-            shmem.write(ADDR_CAPTURER_PARA, para_data);
+            let (mut width, mut height) = (0, 0);
+            if let Ok(displays) = display_service::try_get_displays() {
+                if let Some(display) = displays.get(current_display) {
+                    width = display.width();
+                    height = display.height();
+                }
+            }
+            CapturerPortable { width, height }
         }
     }
 
     impl TraitCapturer for CapturerPortable {
-        fn set_use_yuv(&mut self, use_yuv: bool) {
-            let mut option = SHMEM.lock().unwrap();
-            let shmem = option.as_mut().unwrap();
-            unsafe {
-                let para_ptr = shmem.as_ptr().add(ADDR_CAPTURER_PARA);
-                let para = para_ptr as *const CapturerPara;
-                Self::set_para(
-                    shmem,
-                    CapturerPara {
-                        current_display: (*para).current_display,
-                        use_yuv,
-                        use_yuv_set: true,
-                        timeout_ms: (*para).timeout_ms,
-                    },
-                );
-            }
-        }
-
         fn frame<'a>(&'a mut self, timeout: Duration) -> std::io::Result<Frame<'a>> {
-            let mut option = SHMEM.lock().unwrap();
-            let shmem = option.as_mut().unwrap();
+            let mut lock = SHMEM.lock().unwrap();
+            let shmem = lock.as_mut().ok_or(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "shmem dropped".to_string(),
+            ))?;
             unsafe {
                 let base = shmem.as_ptr();
                 let para_ptr = base.add(ADDR_CAPTURER_PARA);
                 let para = para_ptr as *const CapturerPara;
                 if timeout.as_millis() != (*para).timeout_ms as _ {
-                    Self::set_para(
+                    utils::set_para(
                         shmem,
                         CapturerPara {
+                            recreate: (*para).recreate,
                             current_display: (*para).current_display,
-                            use_yuv: (*para).use_yuv,
-                            use_yuv_set: (*para).use_yuv_set,
                             timeout_ms: timeout.as_millis() as _,
                         },
                     );
                 }
                 if utils::counter_ready(base.add(ADDR_CAPTURE_FRAME_COUNTER)) {
-                    let frame_len_ptr = base.add(ADDR_CAPTURE_FRAME_SIZE);
-                    let frame_len = utils::ptr_to_i32(frame_len_ptr);
+                    let frame_info_ptr = shmem.as_ptr().add(ADDR_CAPTURE_FRAME_INFO);
+                    let frame_info = frame_info_ptr as *const FrameInfo;
+                    if (*frame_info).width != self.width || (*frame_info).height != self.height {
+                        log::info!(
+                            "skip frame, ({},{}) != ({},{})",
+                            (*frame_info).width,
+                            (*frame_info).height,
+                            self.width,
+                            self.height,
+                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "wouldblock error".to_string(),
+                        ));
+                    }
                     let frame_ptr = base.add(ADDR_CAPTURE_FRAME);
-                    let data = slice::from_raw_parts(frame_ptr, frame_len as usize);
-                    Ok(Frame(data))
+                    let data = slice::from_raw_parts(frame_ptr, (*frame_info).length);
+                    Ok(Frame::PixelBuffer(PixelBuffer::new(
+                        data,
+                        self.width,
+                        self.height,
+                    )))
                 } else {
                     let ptr = base.add(ADDR_CAPTURE_WOULDBLOCK);
                     let wouldblock = utils::ptr_to_i32(ptr);
@@ -653,6 +748,14 @@ pub mod client {
         fn set_gdi(&mut self) -> bool {
             true
         }
+
+        #[cfg(feature = "vram")]
+        fn device(&self) -> AdapterDevice {
+            AdapterDevice::default()
+        }
+
+        #[cfg(feature = "vram")]
+        fn set_output_texture(&mut self, _texture: bool) {}
     }
 
     pub(super) fn start_ipc_server() -> mpsc::UnboundedSender<Data> {
@@ -680,7 +783,7 @@ pub mod client {
                                     tokio::spawn(async move {
                                         let mut stream = Connection::new(stream);
                                         let postfix = postfix.to_owned();
-                                        let mut timer = tokio::time::interval(Duration::from_secs(1));
+                                        let mut timer = crate::rustdesk_interval(tokio::time::interval(Duration::from_secs(1)));
                                         let mut nack = 0;
                                         let mut rx = rx_clone.lock().await;
                                         loop {
@@ -767,10 +870,20 @@ pub mod client {
         }
     }
 
-    fn handle_mouse_(evt: &MouseEvent) -> ResultType<()> {
+    fn handle_mouse_(evt: &MouseEvent, conn: i32) -> ResultType<()> {
         let mut v = vec![];
         evt.write_to_vec(&mut v)?;
-        ipc_send(Data::DataPortableService(DataPortableService::Mouse(v)))
+        ipc_send(Data::DataPortableService(DataPortableService::Mouse((
+            v, conn,
+        ))))
+    }
+
+    fn handle_pointer_(evt: &PointerDeviceEvent, conn: i32) -> ResultType<()> {
+        let mut v = vec![];
+        evt.write_to_vec(&mut v)?;
+        ipc_send(Data::DataPortableService(DataPortableService::Pointer((
+            v, conn,
+        ))))
     }
 
     fn handle_key_(evt: &KeyEvent) -> ResultType<()> {
@@ -782,36 +895,48 @@ pub mod client {
     pub fn create_capturer(
         current_display: usize,
         display: scrap::Display,
-        use_yuv: bool,
         portable_service_running: bool,
     ) -> ResultType<Box<dyn TraitCapturer>> {
         if portable_service_running != RUNNING.lock().unwrap().clone() {
             log::info!("portable service status mismatch");
         }
-        if portable_service_running {
+        if portable_service_running && display.is_primary() {
             log::info!("Create shared memory capturer");
-            return Ok(Box::new(CapturerPortable::new(current_display, use_yuv)));
+            return Ok(Box::new(CapturerPortable::new(current_display)));
         } else {
             log::debug!("Create capturer dxgi|gdi");
             return Ok(Box::new(
-                Capturer::new(display, use_yuv).with_context(|| "Failed to create capturer")?,
+                Capturer::new(display).with_context(|| "Failed to create capturer")?,
             ));
         }
     }
 
     pub fn get_cursor_info(pci: PCURSORINFO) -> BOOL {
         if RUNNING.lock().unwrap().clone() {
-            get_cursor_info_(&mut SHMEM.lock().unwrap().as_mut().unwrap(), pci)
+            let mut option = SHMEM.lock().unwrap();
+            option
+                .as_mut()
+                .map_or(FALSE, |sheme| get_cursor_info_(sheme, pci))
         } else {
             unsafe { winuser::GetCursorInfo(pci) }
         }
     }
 
-    pub fn handle_mouse(evt: &MouseEvent) {
+    pub fn handle_mouse(evt: &MouseEvent, conn: i32) {
         if RUNNING.lock().unwrap().clone() {
-            handle_mouse_(evt).ok();
+            crate::input_service::update_latest_input_cursor_time(conn);
+            handle_mouse_(evt, conn).ok();
         } else {
-            crate::input_service::handle_mouse_(evt);
+            crate::input_service::handle_mouse_(evt, conn);
+        }
+    }
+
+    pub fn handle_pointer(evt: &PointerDeviceEvent, conn: i32) {
+        if RUNNING.lock().unwrap().clone() {
+            crate::input_service::update_latest_input_cursor_time(conn);
+            handle_pointer_(evt, conn).ok();
+        } else {
+            crate::input_service::handle_pointer_(evt, conn);
         }
     }
 
@@ -829,9 +954,15 @@ pub mod client {
 }
 
 #[repr(C)]
-struct CapturerPara {
+pub struct CapturerPara {
+    recreate: bool,
     current_display: usize,
-    use_yuv: bool,
-    use_yuv_set: bool,
     timeout_ms: i32,
+}
+
+#[repr(C)]
+pub struct FrameInfo {
+    length: usize,
+    width: usize,
+    height: usize,
 }
